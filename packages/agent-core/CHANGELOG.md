@@ -1,5 +1,14 @@
 # @moonshot-ai/agent-core
 
+## 0.13.2
+
+### Patch Changes
+
+- [#822](https://github.com/MoonshotAI/kimi-code/pull/822) [`66b4d65`](https://github.com/MoonshotAI/kimi-code/commit/66b4d658a055e19359056fe0f2d52202c4a93c25) - Release process stdio resources after managed commands finish or are stopped.
+
+- Updated dependencies [[`66b4d65`](https://github.com/MoonshotAI/kimi-code/commit/66b4d658a055e19359056fe0f2d52202c4a93c25)]:
+  - @moonshot-ai/kaos@0.1.7
+
 ## 0.13.1
 
 ### Patch Changes
