@@ -481,7 +481,7 @@ export class McpConnectionManager {
   ): Promise<{ tools: Tool[]; rawTools: MCPToolDefinition[] }> {
     await client.connect();
     const mcpTools = await client.listTools();
-return {
+    return {
       rawTools: mcpTools,
       tools: mcpTools.map((mcpTool) => {
         const validated = assertMcpInputSchema(mcpTool.name, mcpTool.inputSchema);
@@ -492,7 +492,6 @@ return {
         };
       }),
     };
->>>>>>> 6f20830c5 (fix(agent-core): integrate sanitizeMcpSchema into connectAndDiscoverTools)
   }
 
   private async closeClient(entry: InternalEntry): Promise<void> {
