@@ -132,4 +132,28 @@ describe('SkillSelectorComponent', () => {
     expect(rendered).toContain('Uncategorized');
     expect(rendered).not.toContain('  cv\n');
   });
+
+  it('cycles through group items with Tab key', () => {
+    const onSelect = vi.fn();
+    const onCancel = vi.fn();
+    const selector = new SkillSelectorComponent({
+      skills,
+      onSelect,
+      onCancel,
+    });
+
+    // Root items: cv/ and Uncategorized/
+    let rendered = text(selector);
+    expect(rendered).toContain('❯ cv/');
+
+    // Press Tab to cycle to next group (Uncategorized/)
+    selector.handleInput(Key.tab);
+    rendered = text(selector);
+    expect(rendered).toContain('❯ Uncategorized/');
+
+    // Press Tab again to wrap back to cv/
+    selector.handleInput(Key.tab);
+    rendered = text(selector);
+    expect(rendered).toContain('❯ cv/');
+  });
 });
