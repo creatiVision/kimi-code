@@ -331,14 +331,15 @@ function toKosongProviderConfig(
         ),
       };
     }
-    case 'openai':
+    case 'openai': {
+      // A per-model endpoint (catalog gateway override) wins over the
+      // provider-level base URL, same as the Anthropic branch.
+      const baseUrl =
+        modelBaseUrl ?? providerValue(provider.baseUrl, provider.env, 'OPENAI_BASE_URL');
       return {
         type: 'openai',
         model,
-        // A per-model endpoint (catalog gateway override) wins over the
-        // provider-level base URL, same as the Anthropic branch.
-        baseUrl:
-          modelBaseUrl ?? providerValue(provider.baseUrl, provider.env, 'OPENAI_BASE_URL'),
+        baseUrl,
         apiKey: providerApiKey(provider),
         reasoningKey,
         offEffort,
@@ -346,10 +347,8 @@ function toKosongProviderConfig(
         // same provider-side prompt cache (the OpenAI analog of Anthropic
         // `metadata.user_id` above). Only sent to official OpenAI API
         // endpoints — strictly-validating OpenAI-compatible third-party
-        // endpoints (NVIDIA, Azure Foundry, etc.) reject unknown parameters.
-        ...(promptCacheKey !== undefined && isOfficialOpenAIBaseUrl(
-          modelBaseUrl ?? providerValue(provider.baseUrl, provider.env, 'OPENAI_BASE_URL'),
-        )
+        // endpoints (NVIDIA, Azure Foundry, etc.) reject unknown parameters (#2166).
+        ...(promptCacheKey !== undefined && isOfficialOpenAIBaseUrl(baseUrl)
           ? { generationKwargs: { prompt_cache_key: promptCacheKey } }
           : {}),
         ...defaultHeadersField({
@@ -358,14 +357,16 @@ function toKosongProviderConfig(
           ...provider.customHeaders,
         }),
       };
+    }
     case 'kimi':
       return {
         type: 'kimi',
         model,
         baseUrl: modelBaseUrl ?? providerValue(provider.baseUrl, provider.env, 'KIMI_BASE_URL'),
         apiKey: providerApiKey(provider),
-        // Kimi's API accepts prompt_cache_key on any endpoint.
-        ...(promptCacheKey !== undefined ? { generationKwargs: { prompt_cache_key: promptCacheKey } } : {}),
+        ...(promptCacheKey !== undefined
+          ? { generationKwargs: { prompt_cache_key: promptCacheKey } }
+          : {}),
         ...defaultHeadersField({
           ...envCustomHeaders,
           ...kimiRequestHeaders,
@@ -385,21 +386,20 @@ function toKosongProviderConfig(
           ...provider.customHeaders,
         }),
       };
-    case 'openai_responses':
+    case 'openai_responses': {
+      const baseUrl =
+        modelBaseUrl ?? providerValue(provider.baseUrl, provider.env, 'OPENAI_BASE_URL');
       return {
         type: 'openai_responses',
         model,
-        baseUrl:
-          modelBaseUrl ?? providerValue(provider.baseUrl, provider.env, 'OPENAI_BASE_URL'),
+        baseUrl,
         apiKey: providerApiKey(provider),
         offEffort,
         // Session affinity: same `prompt_cache_key` intent as the `openai`
         // branch; the Responses API accepts it as a top-level request field.
         // Only sent to official OpenAI API endpoints — third-party endpoints
         // reject unknown parameters.
-        ...(promptCacheKey !== undefined && isOfficialOpenAIBaseUrl(
-          modelBaseUrl ?? providerValue(provider.baseUrl, provider.env, 'OPENAI_BASE_URL'),
-        )
+        ...(promptCacheKey !== undefined && isOfficialOpenAIBaseUrl(baseUrl)
           ? { generationKwargs: { prompt_cache_key: promptCacheKey } }
           : {}),
         ...defaultHeadersField({
@@ -408,6 +408,7 @@ function toKosongProviderConfig(
           ...provider.customHeaders,
         }),
       };
+    }
     case 'vertexai': {
       // Resolve the effective endpoint once (config `base_url` or the
       // GOOGLE_VERTEX_BASE_URL env fallback) and use it for BOTH forwarding and
@@ -505,6 +506,25 @@ function vertexAILocation(
   baseUrl: string | undefined,
 ): string | undefined {
   return envValue(provider.env, 'GOOGLE_CLOUD_LOCATION') ?? locationFromVertexAIBaseUrl(baseUrl);
+}
+
+/**
+ * `prompt_cache_key` is an official-OpenAI request field: strictly-validating
+ * OpenAI-compatible endpoints reject unknown parameters with a 400, so session
+ * cache affinity is only requested when the effective base URL targets
+ * `api.openai.com` or a regional variant like `eu.api.openai.com` (or is
+ * unset, which the transport defaults there).
+ */
+function isOfficialOpenAIBaseUrl(baseUrl: string | undefined): boolean {
+  if (baseUrl === undefined) {
+    return true;
+  }
+  try {
+    const hostname = new URL(baseUrl).hostname;
+    return hostname === 'api.openai.com' || hostname.endsWith('.api.openai.com');
+  } catch {
+    return false;
+  }
 }
 
 function providerValue(
