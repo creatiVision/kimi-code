@@ -396,4 +396,48 @@ describe('AgentUserToolService (wire-backed)', () => {
     expect(written[0]).toMatchObject({ type: 'metadata' });
     expect(written.slice(1)).toEqual(records);
   });
+
+  it('resolves the current interaction runtime at execution time', async () => {
+    let currentInteraction = createInteractionStub();
+    const managerStub: IAgentLifecycleService = {
+      resolve: () => currentInteraction,
+    } as unknown as IAgentLifecycleService;
+
+    const ixDynamic = disposables.add(new TestInstantiationService());
+    ixDynamic.stub(IFileSystemStorageService, new InMemoryStorageService());
+    ixDynamic.set(IAppendLogStore, new SyncDescriptor(AppendLogStore));
+    ixDynamic.set(IAgentStateService, new AgentStateService());
+    ixDynamic.set(IAgentToolRegistryService, new SyncDescriptor(AgentToolRegistryService));
+    ixDynamic.stub(IAgentProfileService, createProfileStub());
+    ixDynamic.stub(IAgentLifecycleService, managerStub);
+    ixDynamic.set(IAgentUserToolService, new SyncDescriptor(AgentUserToolService));
+    registerTestAgentWire(ixDynamic, testWireScope(SCOPE, 'user-tool-dynamic'), {
+      log: ixDynamic.get(IAppendLogStore),
+    });
+    registerTestEventDispatcher(ixDynamic);
+    const dynamicSvc = ixDynamic.get(IAgentUserToolService);
+    const dynamicRegistry = ixDynamic.get(IAgentToolRegistryService);
+    dynamicSvc.register(toolA);
+
+    const parked: unknown[] = [];
+    const updatedInteraction: InteractionApi = {
+      request: ((req: unknown) => {
+        parked.push(req);
+        return Promise.resolve({ output: 'from-new-runtime', isError: false });
+      }) as InteractionApi['request'],
+      respond: () => true,
+    };
+    currentInteraction = updatedInteraction;
+
+    const tool = dynamicRegistry.resolve(toolA.name);
+    const execution = await tool!.resolveExecution({ query: 'y' });
+    if (!('execute' in execution)) throw new Error('expected a runnable execution');
+    const res = await execution.execute({
+      turnId: 1,
+      toolCallId: 'call_1',
+      signal: new AbortController().signal,
+    });
+    expect(res).toEqual({ output: 'from-new-runtime', isError: false });
+    expect(parked).toHaveLength(1);
+  });
 });

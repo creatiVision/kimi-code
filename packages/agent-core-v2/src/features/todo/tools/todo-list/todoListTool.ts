@@ -24,13 +24,13 @@ export class TodoListTool implements ITodoListTool {
   readonly description: string = DESCRIPTION;
   readonly parameters: Record<string, unknown> = toInputJsonSchema(TodoListInputSchema);
 
-  private readonly todo: TodoRuntime;
-
   constructor(
-    @IAgentLifecycleService manager: IAgentLifecycleService,
-    @IAgentScopeContext scope: IAgentScopeContext,
-  ) {
-    this.todo = manager.resolve(scope.agentContext, AgentTodo);
+    @IAgentLifecycleService private readonly manager: IAgentLifecycleService,
+    @IAgentScopeContext private readonly scope: IAgentScopeContext,
+  ) {}
+
+  private get todo(): TodoRuntime {
+    return this.manager.resolve(this.scope.agentContext, AgentTodo);
   }
 
   resolveExecution(args: TodoListInput): ToolExecution {

@@ -412,6 +412,31 @@ describe('session interaction helpers', () => {
     expect(isSessionInteractionRecentlyResolved(manager, 'i1')).toBe(true);
     expect(isSessionInteractionRecentlyResolved(manager, 'ghost')).toBe(false);
   });
+
+  it('generates distinct IDs for different agents and responds to the correct agent', async () => {
+    const main = makeRuntimeAgent('main');
+    const sub = makeRuntimeAgent('agent-1');
+    agents.set('main', main);
+    agents.set('agent-1', sub);
+
+    const mainPending = main.runtime.request<unknown, string>({ kind: 'question', payload: {} });
+    const subPending = sub.runtime.request<unknown, string>({ kind: 'question', payload: {} });
+
+    const mainId = main.runtime.listPending()[0]!.id;
+    const subId = sub.runtime.listPending()[0]!.id;
+
+    expect(mainId).not.toBe(subId);
+    expect(mainId).toContain('main');
+    expect(subId).toContain('agent-1');
+
+    respondSessionInteraction(manager, subId, 'sub-response');
+    await expect(subPending).resolves.toBe('sub-response');
+    expect(main.runtime.listPending()).toHaveLength(1);
+
+    respondSessionInteraction(manager, mainId, 'main-response');
+    await expect(mainPending).resolves.toBe('main-response');
+    expect(listSessionPendingInteractions(manager)).toHaveLength(0);
+  });
 });
 
 describe('interaction ops (wire-backed)', () => {

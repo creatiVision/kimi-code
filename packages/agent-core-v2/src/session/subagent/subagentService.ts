@@ -76,6 +76,12 @@ export class SessionSubagentService extends Service implements ISessionSubagentS
   }
 
   run(agent: AgentContext, request: AgentRunRequest, opts: RunAgentOptions): Promise<AgentRunHandle> {
+    const current = this.agentLifecycle.get(agent.agentId);
+    if (current !== agent) {
+      throw new Error2(ErrorCodes.AGENT_NOT_FOUND, `Agent "${agent.agentId}" does not exist`, {
+        details: { agentId: agent.agentId },
+      });
+    }
     const handle = this.agentLifecycle.handleOf(agent.agentId);
     if (handle === undefined) {
       throw new Error2(ErrorCodes.AGENT_NOT_FOUND, `Agent "${agent.agentId}" does not exist`, {

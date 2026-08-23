@@ -511,4 +511,13 @@ describe('SessionSubagentService planSpawn and spawn', () => {
     expect(createAgent).not.toHaveBeenCalled();
     expect(forkAgent).not.toHaveBeenCalled();
   });
+
+  it('rejects running a turn on a stale AgentContext', () => {
+    const svc = service();
+    const staleContext = stubAgentContext(CALLER_ID, 0);
+
+    expect(() =>
+      svc.run(staleContext, { kind: 'prompt', prompt: 'hello' }, { signal: new AbortController().signal }),
+    ).toThrow(`Agent "${CALLER_ID}" does not exist`);
+  });
 });

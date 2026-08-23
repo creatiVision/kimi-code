@@ -136,7 +136,6 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
   readonly onDidFinishCompaction: Event<FullCompactionTask> = this._onDidFinishCompaction.event;
 
   private readonly strategy: CompactionStrategy;
-  private readonly todo: TodoRuntime;
   private _compacting: ActiveCompaction | null = null;
 
   constructor(
@@ -146,7 +145,7 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
     @IAgentProfileService private readonly profile: IAgentProfileService,
     @IAgentToolRegistryService private readonly toolRegistry: IAgentToolRegistryService,
     @IAgentToolSelectService private readonly toolSelect: IAgentToolSelectService,
-    @IAgentLifecycleService manager: IAgentLifecycleService,
+    @IAgentLifecycleService private readonly manager: IAgentLifecycleService,
     @IAgentScopeContext private readonly agent: IAgentScopeContext,
     @ITelemetryService private readonly telemetry: ITelemetryService,
     @IEventDispatcher private readonly dispatcher: IEventDispatcher,
@@ -156,7 +155,6 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
     @IAgentStateService private readonly states: IAgentStateService,
   ) {
     super();
-    this.todo = manager.resolve(agent.agentContext, AgentTodo);
     this.states.contributeState(fullCompactionKey);
     this.states.contributeState(fullCompactionCompactionCountInTurnKey);
     this.states.contributeState(fullCompactionObservedMaxContextTokensByModelKey);
@@ -794,6 +792,10 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
       }
       throw new Error2(ErrorCodes.COMPACTION_FAILED, String(error), { cause: error });
     }
+  }
+
+  private get todo(): TodoRuntime {
+    return this.manager.resolve(this.agent.agentContext, AgentTodo);
   }
 
   private async postProcessSummary(summary: string): Promise<string> {
