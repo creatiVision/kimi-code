@@ -39,6 +39,7 @@ import {
   type StagedNativeUpdate,
 } from './native-stage';
 import { isAutoUpdateDisabledByEnv, shouldAutoInstallUpdates } from './preflight';
+import { isForkManagedInstall } from './fork-updater';
 import { getNativeStagedStateFile, getNativeStagingDir } from '#/utils/paths';
 import { createFileIfAbsent } from '#/utils/persistence';
 
@@ -510,6 +511,15 @@ export async function maybeRelaunchWithStagedNativeUpdate(
     logSwap('discarding staged update (not newer)', {
       staged: staged.version,
       current: deps.currentVersion,
+    });
+    return discard();
+  }
+
+  // Fork pipeline guard: when the installation is managed by the custom fork
+  // pipeline, never allow stock CDN binaries to swap over our custom build.
+  if (isForkManagedInstall(deps.env)) {
+    logSwap('discarding staged stock CDN update (managed by fork pipeline)', {
+      staged: staged.version,
     });
     return discard();
   }
