@@ -24,7 +24,7 @@
 // cross-reducers), blobs (the folding states whose blob codec offloads inline
 // media to blob storage), owner (the source file declaring the class).
 
-// Index (55 record types)
+// Index (60 record types)
 //   config.update                      profile                                               src/agent/profile/profileOps.ts
 //   context.append_loop_event          contextMemory, turn                                   src/agent/contextMemory/contextEvents.ts
 //   context.append_message             contextMemory, plan, task.notificationDelivery        src/agent/contextMemory/contextEvents.ts
@@ -55,7 +55,10 @@
 //   plan.revision                      plan                                                  src/features/plan/planOps.ts
 //   plugin.session_start               pluginSessionStartSnapshot                            src/agent/plugin/agentPluginOps.ts
 //   profile.bind                       profile, profile.activeTools                          src/agent/profile/profileOps.ts
+//   prompt.aborted                     promptResolution                                      src/agent/prompt/promptService.ts
 //   prompt.accepted                    promptAdmission                                       src/agent/prompt/promptOps.ts
+//   prompt.completed                   promptResolution                                      src/agent/prompt/promptService.ts
+//   prompt.steered                     promptResolution                                      src/agent/prompt/promptService.ts
 //   runtime.set_binding                runtimeBinding                                        src/agent/runtimeBinding/runtimeBindingOps.ts
 //   staleGuard.cleared                 staleGuard                                            src/features/staleGuard/staleGuardOps.ts
 //   staleGuard.recorded                staleGuard                                            src/features/staleGuard/staleGuardOps.ts
@@ -73,12 +76,14 @@
 //   tools.set_active_tools             profile.activeTools                                   src/agent/profile/profileOps.ts
 //   tools.unregister_user_tool         userTool                                              src/agent/userTool/userToolOps.ts
 //   tools.update_store                 (none)                                                src/features/todo/todoOps.ts
-//   tower_mode.enter                   tower, tower.owner                                    src/features/tower/towerOps.ts
-//   tower_mode.exit                    tower, tower.owner                                    src/features/tower/towerOps.ts
+//   tower_mode.enter                   tower, tower.base, tower.owner                        src/features/tower/towerOps.ts
+//   tower_mode.exit                    tower, tower.base, tower.owner                        src/features/tower/towerOps.ts
 //   turn.cancel                        turn                                                  src/agent/loop/turnOps.ts
 //   turn.ended                         turn                                                  src/agent/loop/turnOps.ts
 //   turn.prompt                        turn                                                  src/agent/loop/turnOps.ts
 //   turn.steer                         turn                                                  src/agent/loop/turnOps.ts
+//   turn.step.interrupted              (none)                                                src/agent/loop/turnEvents.ts
+//   turn.step.retrying                 (none)                                                src/agent/stepRetry/stepRetryService.ts
 //   usage.record                       (none)                                                src/agent/usage/usageOps.ts
 
 /**
@@ -464,7 +469,7 @@ interface PlanRevisionPayload {
   agentId: string;
   id: string;
   version: number;
-  path: string;
+  key: string;
   sha256: string;
   bytes: number;
 }
@@ -503,6 +508,17 @@ interface ProfileBindPayload {
 }
 
 /**
+ * states: promptResolution
+ * owner: src/agent/prompt/promptService.ts
+ */
+interface PromptAbortedPayload {
+  _name: 'prompt.aborted';
+  agentId: string;
+  promptId: string;
+  abortedAt: string;
+}
+
+/**
  * states: promptAdmission
  * owner: src/agent/prompt/promptOps.ts
  */
@@ -511,6 +527,31 @@ interface PromptAcceptedPayload {
   agentId: string;
   promptId: string;
   content?: any;
+}
+
+/**
+ * states: promptResolution
+ * owner: src/agent/prompt/promptService.ts
+ */
+interface PromptCompletedPayload {
+  _name: 'prompt.completed';
+  agentId: string;
+  promptId: string;
+  finishedAt: string;
+  reason: 'completed' | 'failed' | 'blocked';
+}
+
+/**
+ * states: promptResolution
+ * owner: src/agent/prompt/promptService.ts
+ */
+interface PromptSteeredPayload {
+  _name: 'prompt.steered';
+  agentId: string;
+  activePromptId: string;
+  promptIds: string[];
+  content: ContentPart[];
+  steeredAt: string;
 }
 
 /**
@@ -695,17 +736,18 @@ interface ToolsUpdateStorePayload {
 }
 
 /**
- * states: tower, tower.owner
+ * states: tower, tower.base, tower.owner
  * owner: src/features/tower/towerOps.ts
  */
 interface TowerModeEnterPayload {
   _name: 'tower_mode.enter';
   agentId: string;
   sessionId?: string;
+  base?: string;
 }
 
 /**
- * states: tower, tower.owner
+ * states: tower, tower.base, tower.owner
  * owner: src/features/tower/towerOps.ts
  */
 interface TowerModeExitPayload {
@@ -808,6 +850,39 @@ interface TurnSteerPayload {
 
 /**
  * states: (none)
+ * owner: src/agent/loop/turnEvents.ts
+ */
+interface TurnStepInterruptedPayload {
+  _name: 'turn.step.interrupted';
+  agentId: string;
+  turnId: number;
+  step: number;
+  stepId?: string;
+  reason: string;
+  message?: string;
+}
+
+/**
+ * states: (none)
+ * owner: src/agent/stepRetry/stepRetryService.ts
+ */
+interface TurnStepRetryingPayload {
+  _name: 'turn.step.retrying';
+  agentId: string;
+  turnId: number;
+  step: number;
+  stepId?: string;
+  failedAttempt: number;
+  nextAttempt: number;
+  maxAttempts: number;
+  delayMs: number;
+  errorName: string;
+  errorMessage: string;
+  statusCode?: number;
+}
+
+/**
+ * states: (none)
  * owner: src/agent/usage/usageOps.ts
  */
 interface UsageRecordPayload {
@@ -857,7 +932,10 @@ interface WirePayloadMap {
   "plan.revision": PlanRevisionPayload;
   "plugin.session_start": PluginSessionStartPayload;
   "profile.bind": ProfileBindPayload;
+  "prompt.aborted": PromptAbortedPayload;
   "prompt.accepted": PromptAcceptedPayload;
+  "prompt.completed": PromptCompletedPayload;
+  "prompt.steered": PromptSteeredPayload;
   "runtime.set_binding": RuntimeSetBindingPayload;
   "staleGuard.cleared": StaleGuardClearedPayload;
   "staleGuard.recorded": StaleGuardRecordedPayload;
@@ -881,5 +959,7 @@ interface WirePayloadMap {
   "turn.ended": TurnEndedPayload;
   "turn.prompt": TurnPromptPayload;
   "turn.steer": TurnSteerPayload;
+  "turn.step.interrupted": TurnStepInterruptedPayload;
+  "turn.step.retrying": TurnStepRetryingPayload;
   "usage.record": UsageRecordPayload;
 }
