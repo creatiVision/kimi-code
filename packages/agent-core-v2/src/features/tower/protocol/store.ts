@@ -9,9 +9,13 @@ import { parseFrontmatter, renderFrontmatter } from './frontmatter';
 import {
   branchExists,
   branchTip,
+  checkoutNewLocalBranch,
+  commitAllowEmpty,
+  commitPaths,
   currentBranch,
   diffNameOnly,
   hasAnyCommit,
+  initRepository,
   isAncestor,
   isInsideRepo,
   isWorktreeDirty,
@@ -135,6 +139,14 @@ function isOpenMission(mission: Pick<TowerMission, 'status'>): boolean {
   return mission.status !== 'merged' && mission.status !== 'abandoned';
 }
 
+export async function assertLocalBaseBranch(repoRoot: string, base: string): Promise<void> {
+  if (!(await branchExists(repoRoot, base))) {
+    throw new TowerProtocolError(
+      `base branch "${base}" does not exist as a local branch — merges land on a local branch, so remote-tracking refs and tags are not accepted; create a local branch first`,
+    );
+  }
+}
+
 export class TowerStore {
   constructor(readonly repoRoot: string) {}
 
@@ -147,12 +159,28 @@ export class TowerStore {
     }
   }
 
-  async init(sessionId?: string, base?: string): Promise<TowerInitResult> {
-    if (!(await isInsideRepo(this.repoRoot))) {
-      throw new TowerProtocolError(
-        'tower needs a git repository (the session working directory is not inside one)',
-      );
+  async ensureRepository(base?: string): Promise<void> {
+    if (await isInsideRepo(this.repoRoot)) return;
+    await initRepository(this.repoRoot);
+    const unborn = (await tryGit(this.repoRoot, ['symbolic-ref', '--short', 'HEAD'])) ?? 'main';
+    const resolvedBase = base ?? unborn;
+    if (resolvedBase !== unborn) {
+      await checkoutNewLocalBranch(this.repoRoot, resolvedBase);
     }
+    const dirty = await listBaseDirtyEntries(this.repoRoot);
+    if (dirty.length === 0) {
+      await commitAllowEmpty(this.repoRoot, 'tower: init');
+      return;
+    }
+    await commitPaths(
+      this.repoRoot,
+      dirty.map((entry) => entry.path),
+      `tower: snapshot of uncommitted base checkout changes (base ${resolvedBase})`,
+    );
+  }
+
+  async init(sessionId?: string, base?: string): Promise<TowerInitResult> {
+    await this.ensureRepository(base);
     if (!(await hasAnyCommit(this.repoRoot))) {
       throw new TowerProtocolError(
         'the repository has no commits yet — create an initial commit first',
@@ -174,11 +202,7 @@ export class TowerStore {
     const checkout = await this.checkedOutBranch();
     let resolvedBase: string;
     if (base !== undefined) {
-      if (!(await branchExists(this.repoRoot, base))) {
-        throw new TowerProtocolError(
-          `base branch "${base}" does not exist as a local branch — merges land on a local branch, so remote-tracking refs and tags are not accepted; create a local branch first`,
-        );
-      }
+      await assertLocalBaseBranch(this.repoRoot, base);
       resolvedBase = base;
     } else {
       if (checkout === 'HEAD') {
@@ -210,6 +234,21 @@ export class TowerStore {
     return { base: resolvedBase, created: true, retiredAgents: [], checkout, openMissions: [] };
   }
 
+  async rebase(base: string): Promise<void> {
+    const state = await this.load();
+    if (state.base === base) return;
+    const open = state.missions.filter(isOpenMission);
+    if (open.length > 0) {
+      throw new TowerProtocolError(
+        `cannot rebase the tower from "${state.base}" to "${base}" — ${String(open.length)} mission(s) are still open (${open.map((m) => m.id).join(', ')}); merge or abandon them first (or TowerTeardown and start over)`,
+      );
+    }
+    await assertLocalBaseBranch(this.repoRoot, base);
+    const from = state.base;
+    await this.save({ ...state, base });
+    await this.appendLog(TOWER_NAME, 'rebase', { from, to: base });
+  }
+
   private async checkedOutBranch(): Promise<string> {
     return (await tryGit(this.repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD'])) ?? 'HEAD';
   }
@@ -234,6 +273,15 @@ export class TowerStore {
       retired: stale.length > 0 ? stale.map((agent) => agent.name).join(',') : undefined,
     });
     return stale.map((agent) => agent.name);
+  }
+
+  async release(sessionId: string): Promise<void> {
+    if (!(await this.isInitialized())) return;
+    const state = await this.load();
+    if (state.sessionId !== sessionId) return;
+    state.sessionId = undefined;
+    await this.save(state);
+    await this.appendLog(TOWER_NAME, 'release', { session: sessionId });
   }
 
   private async ensureGitExclude(): Promise<void> {
@@ -325,6 +373,63 @@ export class TowerStore {
     }
     state.roster.agents.push(entry);
     await this.save(state);
+  }
+
+  async markAgentDied(
+    agentId: string,
+    status: string,
+    reason?: string,
+  ): Promise<TowerRosterEntry | undefined> {
+    const state = await this.load();
+    const index = state.roster.agents.findIndex((agent) => agent.agentId === agentId);
+    const existing = state.roster.agents[index];
+    if (existing === undefined) return undefined;
+    if (existing.diedAt !== undefined) return existing;
+    const entry: TowerRosterEntry = {
+      ...existing,
+      diedAt: new Date().toISOString(),
+      deathStatus: status,
+      deathReason: reason,
+    };
+    state.roster.agents[index] = entry;
+    await this.save(state);
+    const mission = state.missions.find((m) => m.id === entry.missionId);
+    await this.appendLog(
+      TOWER_NAME,
+      'died',
+      {
+        name: entry.name,
+        agent: agentId,
+        kind: entry.kind,
+        status,
+        reason: reason === undefined ? undefined : reason.replace(/\s+/g, ' ').slice(0, 200),
+        mission: entry.missionId,
+        target: entry.reviewTarget,
+      },
+      mission !== undefined ? join(MISSIONS_DIR, missionFileName(mission.id, mission.slug)) : undefined,
+    );
+    return entry;
+  }
+
+  async clearAgentDied(agentId: string): Promise<boolean> {
+    const state = await this.load();
+    const index = state.roster.agents.findIndex((agent) => agent.agentId === agentId);
+    const existing = state.roster.agents[index];
+    if (existing === undefined || existing.diedAt === undefined) return false;
+    const entry: TowerRosterEntry = {
+      ...existing,
+      diedAt: undefined,
+      deathStatus: undefined,
+      deathReason: undefined,
+    };
+    state.roster.agents[index] = entry;
+    await this.save(state);
+    await this.appendLog(TOWER_NAME, 'revived', {
+      name: entry.name,
+      agent: agentId,
+      kind: entry.kind,
+    });
+    return true;
   }
 
   async plan(input: readonly TowerPlanInput[]): Promise<readonly TowerMission[]> {

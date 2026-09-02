@@ -19,8 +19,8 @@
 import { readFile } from 'node:fs/promises';
 
 import {
-  AgentCron,
-  AgentGoal,
+  IAgentCronService,
+  IAgentGoalService,
   IAgentLifecycleService,
   IAgentPermissionModeService,
   IAgentProfileService,
@@ -36,7 +36,6 @@ import {
   ITelemetryService,
   PRINT_MAX_TURNS_DEFAULT,
   PRINT_WAIT_CEILING_S_DEFAULT,
-  agentContextOf,
   applyPrintModeConfigDefaults,
   bootstrap,
   createCloudAppender,
@@ -210,7 +209,7 @@ export async function runV2Print(
     // model is reconciled via setContext once resolved.
     telemetryService = app.accessor.get(ITelemetryService);
     if (telemetryEnabled) {
-      telemetryService.setAppender(
+      telemetryService.addAppender(
         createCloudAppender(app.accessor, {
           deviceId,
           appName: CLI_USER_AGENT_PRODUCT,
@@ -224,7 +223,7 @@ export async function runV2Print(
     const resolved = await resolveNativeSession(app, opts, workDir, defaultModel, stderr);
     restorePermission = resolved.restorePermission;
 
-    telemetryService.setContext({ sessionId: resolved.session.id, model: resolved.telemetryModel });
+    telemetryService.setContext({ session_id: resolved.session.id, model: resolved.telemetryModel });
     if (firstLaunch) {
       telemetryService.track2('first_launch');
     }
@@ -254,7 +253,7 @@ export async function runV2Print(
     }
     writeResumeHint(resolved.session.id, outputFormat, stdout, stderr);
 
-    telemetryService.withContext({ sessionId: resolved.session.id }).track2('exit', {
+    telemetryService.withContext({ session_id: resolved.session.id }).track2('exit', {
       duration_ms: Date.now() - startedAt,
     });
   } finally {
@@ -472,12 +471,8 @@ async function runNativeTurn(
     if (result.type === 'completed') {
       const configService = app.accessor.get(IConfigService);
       const taskConfig = resolveAgentTaskConfig(configService);
-      const goalService = session.accessor
-        .get(IAgentLifecycleService)
-        .resolve(agentContextOf(agent), AgentGoal);
-      const cronService = session.accessor
-        .get(IAgentLifecycleService)
-        .resolve(agentContextOf(agent), AgentCron);
+      const goalService = agent.accessor.get(IAgentGoalService);
+      const cronService = agent.accessor.get(IAgentCronService);
       try {
         await applyPrintBackgroundPolicy({
           mode: resolvePrintBackgroundMode(configService),
@@ -530,9 +525,7 @@ async function runNativeGoal(
   stderr: PromptOutput,
 ): Promise<void> {
   requireConfiguredModel(model);
-  const goalService = session.accessor
-    .get(IAgentLifecycleService)
-    .resolve(agentContextOf(agent), AgentGoal);
+  const goalService = agent.accessor.get(IAgentGoalService);
   await goalService.createGoal({
     objective: goal.objective,
     replace: goal.replace,

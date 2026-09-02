@@ -90,6 +90,40 @@ async function cleanReview(reviewer: string, target: string): Promise<void> {
   });
 }
 
+describe('init in a non-git directory', () => {
+  it('bootstraps an empty directory with git init and an empty initial commit', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tower-store-nogit-empty-'));
+    try {
+      const result = await new TowerStore(dir).init('session-a');
+      const branch = await git(dir, 'symbolic-ref', '--short', 'HEAD');
+      expect(result).toMatchObject({ base: branch, created: true, checkout: branch });
+      expect(await git(dir, 'rev-list', '--count', 'HEAD')).toBe('1');
+      expect(await git(dir, 'log', '-1', '--format=%s')).toBe('tower: init');
+      expect(await git(dir, 'status', '--porcelain')).toBe('');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('snapshots the existing files of a non-empty directory onto the requested base', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tower-store-nogit-dirty-'));
+    try {
+      await mkdir(join(dir, 'src'), { recursive: true });
+      await writeFile(join(dir, 'src', 'app.ts'), 'export {}\n');
+      await writeFile(join(dir, 'README.md'), '# scratch\n');
+      const result = await new TowerStore(dir).init('session-a', 'tower-base');
+      expect(result).toMatchObject({ base: 'tower-base', created: true, checkout: 'tower-base' });
+      expect(await git(dir, 'log', '-1', '--format=%s')).toBe(
+        'tower: snapshot of uncommitted base checkout changes (base tower-base)',
+      );
+      expect(await git(dir, 'ls-files')).toContain('src/app.ts');
+      expect(await git(dir, 'status', '--porcelain')).toBe('');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('init', () => {
   it('creates the directory skeleton, state.json, and the git exclude entry', async () => {
     const result = await store.init();
@@ -240,6 +274,151 @@ describe('init', () => {
     });
     const state = await store.load();
     expect(state.base).toBe('main');
+  });
+});
+
+describe('release', () => {
+  it('clears the recorded owner and logs the release when the session matches', async () => {
+    await store.init('session-a');
+
+    await store.release('session-a');
+
+    const state = await store.load();
+    expect(state.sessionId).toBeUndefined();
+    const log = await store.recentLog(5);
+    expect(log.some((line) => line.includes(' release ') && line.includes('session=session-a'))).toBe(true);
+  });
+
+  it('keeps the recorded owner for a different session and logs nothing', async () => {
+    await store.init('session-a');
+
+    await store.release('session-b');
+
+    const state = await store.load();
+    expect(state.sessionId).toBe('session-a');
+    const log = await store.recentLog(5);
+    expect(log.some((line) => line.includes(' release '))).toBe(false);
+  });
+
+  it('is a no-op while the workspace is not initialized', async () => {
+    await store.release('session-a');
+
+    expect(await store.isInitialized()).toBe(false);
+  });
+
+  it('is idempotent once ownership is already released', async () => {
+    await store.init('session-a');
+    await store.release('session-a');
+
+    await store.release('session-a');
+
+    expect((await store.load()).sessionId).toBeUndefined();
+    const log = await store.recentLog(10);
+    expect(log.filter((line) => line.includes(' release '))).toHaveLength(1);
+  });
+
+  it('lets another session adopt the workspace after the owner released it', async () => {
+    await store.init('session-a');
+    await store.release('session-a');
+
+    const result = await store.init('session-b');
+
+    expect(result.created).toBe(false);
+    expect(result.retiredAgents).toEqual([]);
+    expect((await store.load()).sessionId).toBe('session-b');
+  });
+});
+
+describe('markAgentDied', () => {
+  it('marks the roster entry and appends an activity log line', async () => {
+    await store.init('session-a');
+    const missions = await store.plan([{ title: 'engine', scope: ['src/engine/**'] }]);
+    const mission = missions[0]!;
+    await store.registerAgent(
+      rosterEntry({ name: 'w1', kind: 'worker', agentId: 'agent-w1', missionId: mission.id }),
+    );
+
+    const entry = await store.markAgentDied('agent-w1', 'failed', 'provider blew up\nstack line');
+
+    expect(entry?.diedAt).toBeDefined();
+    expect(entry?.deathStatus).toBe('failed');
+    expect(entry?.deathReason).toBe('provider blew up\nstack line');
+    const state = await store.load();
+    expect(state.roster.agents[0]?.diedAt).toBe(entry?.diedAt);
+    const log = await readFile(join(repo, '.tower/comms/log/activity.log'), 'utf8');
+    const diedLine = log.split('\n').find((line) => line.includes(' died '));
+    expect(diedLine).toBeDefined();
+    expect(diedLine).toContain('name=w1');
+    expect(diedLine).toContain('agent=agent-w1');
+    expect(diedLine).toContain('status=failed');
+    expect(diedLine).toContain('reason=provider blew up stack line');
+    expect(diedLine).toContain(`mission=${mission.id}`);
+    expect(diedLine).toContain('ref=');
+    expect(diedLine).toContain(mission.id);
+  });
+
+  it('is a no-op for unknown or already-dead agents', async () => {
+    await store.init('session-a');
+    await store.registerAgent(rosterEntry({ name: 'w1', kind: 'worker', agentId: 'agent-w1' }));
+
+    expect(await store.markAgentDied('agent-ghost', 'failed')).toBeUndefined();
+
+    const first = await store.markAgentDied('agent-w1', 'failed', 'first');
+    const second = await store.markAgentDied('agent-w1', 'timed_out', 'second');
+    expect(second?.diedAt).toBe(first?.diedAt);
+    expect(second?.deathStatus).toBe('failed');
+    expect(second?.deathReason).toBe('first');
+  });
+
+  it('clearAgentDied removes the death mark and logs the revival', async () => {
+    await store.init('session-a');
+    await store.registerAgent(rosterEntry({ name: 'w1', kind: 'worker', agentId: 'agent-w1' }));
+    await store.markAgentDied('agent-w1', 'failed', 'boom');
+
+    expect(await store.clearAgentDied('agent-w1')).toBe(true);
+    expect(await store.clearAgentDied('agent-w1')).toBe(false);
+    expect(await store.clearAgentDied('agent-ghost')).toBe(false);
+
+    const state = await store.load();
+    expect(state.roster.agents[0]?.diedAt).toBeUndefined();
+    expect(state.roster.agents[0]?.deathStatus).toBeUndefined();
+    expect(state.roster.agents[0]?.deathReason).toBeUndefined();
+    const log = await readFile(join(repo, '.tower/comms/log/activity.log'), 'utf8');
+    const revivedLine = log.split('\n').find((line) => line.includes(' revived '));
+    expect(revivedLine).toBeDefined();
+    expect(revivedLine).toContain('name=w1');
+    expect(revivedLine).toContain('agent=agent-w1');
+  });
+});
+
+describe('rebase', () => {
+  it('switches the recorded base and logs it when no missions are open', async () => {
+    await git(repo, 'branch', 'develop');
+    await store.init('session-a', 'main');
+
+    await store.rebase('develop');
+
+    expect((await store.load()).base).toBe('develop');
+    const log = await readFile(join(repo, '.tower/comms/log/activity.log'), 'utf8');
+    expect(log).toContain('rebase');
+    expect(log).toContain('from=main');
+    expect(log).toContain('to=develop');
+  });
+
+  it('refuses while missions are open and keeps the recorded base', async () => {
+    await git(repo, 'branch', 'develop');
+    await store.init('session-a', 'main');
+    await store.plan([{ title: 'engine', scope: ['src/engine/**'] }]);
+
+    await expect(store.rebase('develop')).rejects.toThrow('cannot rebase');
+    expect((await store.load()).base).toBe('main');
+  });
+
+  it('rejects a base that is not a local branch', async () => {
+    await store.init('session-a', 'main');
+
+    await expect(store.rebase('develop')).rejects.toThrow('does not exist as a local branch');
+    expect((await store.load()).base).toBe('main');
   });
 });
 
