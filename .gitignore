@@ -43,3 +43,7 @@ handover.md
 *-mockup.html
 *-demo.html
 *-demos.html
+
+# Graphify knowledge graph (synced via Syncthing, never committed)
+graphify-out/
+graphify-out.*
