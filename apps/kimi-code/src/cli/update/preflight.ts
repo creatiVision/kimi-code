@@ -11,6 +11,7 @@ import {
 import { loadTuiConfig } from '#/tui/config';
 import { resolveCommandPath } from '#/utils/process/resolve-command';
 
+import { resolveForkUpdateScript } from './fork-updater';
 import { readUpdateCache } from './cache';
 import { tryAcquireUpdateInstallLock } from './install-lock';
 import { emptyUpdateInstallState, readUpdateInstallState, writeUpdateInstallState } from './install-state';
@@ -70,6 +71,12 @@ export function installCommandFor(
   version: string,
   platform: NodeJS.Platform,
 ): string {
+  if (source === 'native') {
+    const forkScript = resolveForkUpdateScript();
+    if (forkScript !== undefined) {
+      return `bash ${forkScript} --fast`;
+    }
+  }
   switch (source) {
     case 'npm-global':
       return `npm install -g ${NPM_PACKAGE_NAME}@${version}`;
@@ -128,13 +135,18 @@ export function spawnForSource(
       return { cmd: bunCommand(platform), args: ['add', '-g', `${NPM_PACKAGE_NAME}@${version}`] };
     case 'homebrew':
       return { cmd: 'brew', args: ['upgrade', 'kimi-code'] };
-    case 'native':
+    case 'native': {
+      const forkScript = resolveForkUpdateScript();
+      if (forkScript !== undefined) {
+        return { cmd: 'bash', args: [forkScript, '--auto'] };
+      }
       // Native installs self-spawn the hidden downloader sub-command, which
       // stages the binary next to the exe (verified against the release
       // manifest's sha256); the swap happens on the next startup. This
       // replaces the old `curl|bash` / `irm|iex` re-install dance — no shell,
       // no pipeline exit-status loss, no PowerShell dependency on Windows.
       return { cmd: process.execPath, args: ['__update_download', version] };
+    }
     case 'unsupported':
       throw new Error('unsupported install source cannot be auto-installed');
   }
@@ -173,12 +185,21 @@ function resolveInstallSpawn(
   platform: NodeJS.Platform,
   options?: { readonly manual?: boolean },
 ): { readonly resolvedCmd: string; readonly args: readonly string[]; readonly shell: boolean } | undefined {
-  const { cmd, args } = spawnForSource(source, version, platform);
   if (source === 'native') {
+    const forkScript = resolveForkUpdateScript();
+    if (forkScript !== undefined) {
+      const flag = options?.manual === true ? '--fast' : '--auto';
+      return { resolvedCmd: 'bash', args: [forkScript, flag], shell: false };
+    }
     // A user-confirmed install marks the stage as manual so the startup swap
     // applies it even when automatic updates are opted out via env.
-    return { resolvedCmd: cmd, args: options?.manual === true ? [...args, '--manual'] : args, shell: false };
+    return {
+      resolvedCmd: process.execPath,
+      args: options?.manual === true ? ['__update_download', version, '--manual'] : ['__update_download', version],
+      shell: false,
+    };
   }
+  const { cmd, args } = spawnForSource(source, version, platform);
   const resolvedCmd = resolveSpawnCommand(cmd, platform);
   if (resolvedCmd === undefined) return undefined;
   return { resolvedCmd, args, shell: platform === 'win32' };
@@ -209,9 +230,11 @@ export function renderManualUpdateMessage(
     case 'homebrew':
       sourceDesc = 'homebrew';
       break;
-    case 'native':
-      sourceDesc = 'native installer';
+    case 'native': {
+      const forkScript = resolveForkUpdateScript();
+      sourceDesc = forkScript !== undefined ? `fork orchestrator (${forkScript})` : 'native installer';
       break;
+    }
     case 'unsupported':
       sourceDesc = 'unsupported package manager or layout.';
       break;

@@ -6,8 +6,10 @@
  * place happens on the next startup (see `cli/update/native-swap.ts`).
  */
 
+import { spawn } from 'node:child_process';
 import { log } from '@moonshot-ai/kimi-code-sdk';
 
+import { resolveForkUpdateScript } from '#/cli/update/fork-updater';
 import {
   readUpdateInstallLockVersion,
   tryAcquireUpdateInstallLock,
@@ -85,6 +87,23 @@ export async function runUpdateDownloadCommand(
   version: string,
   manual: boolean = false,
 ): Promise<number> {
+  const forkScript = resolveForkUpdateScript();
+  if (forkScript !== undefined) {
+    const flag = manual ? '--fast' : '--auto';
+    return new Promise<number>((resolveExit) => {
+      const child = spawn('bash', [forkScript, flag], {
+        stdio: 'inherit',
+      });
+      child.once('error', (err) => {
+        process.stderr.write(`error: failed to run fork updater: ${err.message}\n`);
+        resolveExit(1);
+      });
+      child.once('exit', (code) => {
+        resolveExit(code ?? 0);
+      });
+    });
+  }
+
   if (!detectNativeInstall()) {
     process.stderr.write('error: update download is only available in the native build\n');
     return 1;
