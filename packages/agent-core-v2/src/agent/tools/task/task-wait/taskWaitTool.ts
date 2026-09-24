@@ -11,11 +11,11 @@ import { registerAgentToolService } from '#/agent/toolRegistry/toolContribution'
 import { IAgentTaskService } from '#/agent/task/task';
 import type { AgentTaskInfo, AgentTaskOutputSnapshot } from '#/agent/task/task';
 import { TERMINAL_STATUSES } from '#/agent/task/types';
-import { formatPlainObject } from '#/agent/task/tools/format';
+import { formatPlainObject, formatTaskRecord } from '#/agent/task/tools/format';
 import { formatTaskList } from '#/agent/tools/task/task-list/taskListTool';
 import { IFlagService } from '#/app/flag/flag';
 import { ITelemetryService } from '#/app/telemetry/telemetry';
-import { abortError, linkAbortSignal } from '#/_base/utils/abort';
+import { abortError, isAbortError, linkAbortSignal } from '#/_base/utils/abort';
 import { WAIT_FOR_FLAG_ID } from './flag';
 import { IWaitForTool, WaitForInputSchema, type WaitForInput } from './task-wait';
 import WAIT_FOR_DESCRIPTION from './task-wait.md?raw';
@@ -26,7 +26,7 @@ const PAGING_HINT_LINES = 300;
 
 const PROGRESS_INTERVAL_MS = 1_000;
 
-type WaitForOutcome = 'completed' | 'timed_out' | 'task_not_found' | 'aborted';
+type WaitForOutcome = 'completed' | 'timed_out' | 'task_not_found' | 'aborted' | 'interrupted';
 
 function terminalReason(info: AgentTaskInfo): 'timed_out' | 'stopped' | 'failed' | undefined {
   if (info.status === 'timed_out') return 'timed_out';
@@ -166,13 +166,23 @@ export class WaitForTool implements IWaitForTool {
     }
 
     let waited: AgentTaskInfo | undefined;
+    const signal = ctx.steerSignal === undefined
+      ? ctx.signal
+      : AbortSignal.any([ctx.signal, ctx.steerSignal]);
     const progress = startWaitProgress(args, this.tasks, ctx.onUpdate, startedAt);
     try {
       waited =
         args.task_id === undefined
-          ? await this.waitAny(runningAtStart, timeoutMs, ctx.signal)
-          : await this.tasks.wait(args.task_id, timeoutMs, ctx.signal);
+          ? await this.waitAny(runningAtStart, timeoutMs, signal)
+          : await this.tasks.wait(args.task_id, timeoutMs, signal);
     } catch (error) {
+      if (
+        !ctx.signal.aborted && ctx.steerSignal?.aborted &&
+        (error === ctx.steerSignal.reason || isAbortError(error))
+      ) {
+        this.track(args, startedAt, timeoutMs, 'interrupted', 0);
+        return { output: this.formatInterrupted(args, startedAt, timeoutMs), isError: false };
+      }
       this.track(args, startedAt, timeoutMs, 'aborted', 0);
       throw error;
     } finally {
@@ -254,6 +264,24 @@ export class WaitForTool implements IWaitForTool {
     return lines.join('\n');
   }
 
+  private formatInterrupted(args: WaitForInput, startedAt: number, timeoutMs: number): string {
+    const lines = [
+      formatPlainObject({
+        waitStatus: 'interrupted',
+        reason: 'steer',
+        taskId: args.task_id,
+        waitedMs: Date.now() - startedAt,
+        timeoutMs,
+      }),
+      'New input ended this wait early. Read the new input before deciding what to do next. Background tasks have not been stopped; completion still arrives via automatic notification.',
+    ];
+    const running = this.tasks.list(true);
+    if (running.length > 0) {
+      lines.push('', '[still_running]', formatTaskList(running, true));
+    }
+    return lines.join('\n');
+  }
+
   private async formatCompleted(
     finished: AgentTaskInfo,
     extras: readonly AgentTaskInfo[],
@@ -275,7 +303,7 @@ export class WaitForTool implements IWaitForTool {
       lines.push(
         '',
         '[completed_during_wait]',
-        extras.map((extra) => formatPlainObject(extra)).join('\n---\n'),
+        extras.map((extra) => formatTaskRecord(extra)).join('\n---\n'),
         'Use TaskOutput with one of the task_id values above to read the full output.',
       );
     }
@@ -289,7 +317,7 @@ export class WaitForTool implements IWaitForTool {
   private async formatFinishedTask(info: AgentTaskInfo): Promise<string[]> {
     const output = await this.tasks.getOutputSnapshot(info.taskId, OUTPUT_PREVIEW_BYTES);
     const lines = [
-      formatPlainObject({
+      formatTaskRecord({
         ...info,
         outputPath: output.outputPath,
         terminalReason: terminalReason(info),

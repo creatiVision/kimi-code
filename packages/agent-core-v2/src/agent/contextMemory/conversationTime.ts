@@ -8,14 +8,24 @@ import {
 } from './contextEvents';
 import type { ContextMessage } from './types';
 
-export function isUndoAnchor(message: ContextMessage): boolean {
-  if (message.role !== 'user') return false;
-  const origin = message.origin;
+export function markInTurnOrigin<T extends { readonly kind: string }>(
+  origin: T,
+): T & { readonly inTurn: true } {
+  return { ...origin, inTurn: true };
+}
+
+export function isUndoAnchorOrigin(origin: ContextMessage['origin']): boolean {
+  if (origin !== undefined && 'inTurn' in origin && origin.inTurn === true) return false;
   if (origin === undefined || origin.kind === 'user') return true;
   return (
     (origin.kind === 'skill_activation' || origin.kind === 'plugin_command') &&
     origin.trigger === 'user-slash'
   );
+}
+
+export function isUndoAnchor(message: ContextMessage): boolean {
+  if (message.role !== 'user') return false;
+  return isUndoAnchorOrigin(message.origin);
 }
 
 export function isPromptOwnedInjection(

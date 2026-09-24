@@ -21,11 +21,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   buildDaemonFileUrl,
-  createKimiHarnessV2,
+  createKimiHarness,
   ErrorCodes,
   isDaemonFileUrl,
   isKimiError,
   KimiHarness,
+  limitAgentReplayByTurns,
   removeProviderFromConfig,
   SDKRpcClientV2,
   toKimiErrorPayload,
@@ -39,20 +40,31 @@ import {
   Error2,
   getLiveSessionById,
   HostProcessError,
-  AgentTodo,
+  IAgentIdentity,
+  IAgentTodoService,
   IAgentLifecycleService,
+  IAgentProfileService,
+  IAgentToolActivationService,
+  IAgentToolRegistryService,
+  INotifyUserTool,
+  IAtomicDocumentStore,
+  ISessionContext,
   IAgentTowerService,
   IHostRequestHeaders,
   IMcpManagementService,
   IMcpOAuthService,
   ISessionManager,
+  MAIN_AGENT_ID,
   OsProcessErrors,
 } from '@moonshot-ai/agent-core-v2';
 
-import { McpOAuthService } from '../../agent-core/src/mcp/oauth/service';
 import { McpOAuthService as McpOAuthServiceV2 } from '@moonshot-ai/agent-core-v2/mcpCore/oauth/service';
 
 import { TEST_IDENTITY } from './test-identity';
+import {
+  resetModelsDevUpstreamForTest,
+  setModelsDevUpstreamForTest,
+} from '@moonshot-ai/agent-core-v2/app/kosongConfig/modelsDevUpstream';
 import { recordingTelemetry, type TelemetryRecord } from './telemetry';
 
 const hostEnvProbe = vi.hoisted(() => ({ failWithMissingShell: false }));
@@ -77,6 +89,7 @@ vi.mock('@moonshot-ai/agent-core-v2/_base/execEnv/environmentProbe', async (impo
 const tempDirs: string[] = [];
 
 afterEach(async () => {
+  resetModelsDevUpstreamForTest();
   // The read-model mirror/query-store close asynchronously on dispose; await
   // the drains so the rm below never races their final flush (ENOTEMPTY).
   await drainSessionIndexMirror();
@@ -99,7 +112,7 @@ function stubProcessPlatform(platform: NodeJS.Platform): () => void {
 async function makeHarness(): Promise<{ harness: KimiHarness; homeDir: string }> {
   const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-'));
   tempDirs.push(homeDir);
-  return { harness: createKimiHarnessV2({ homeDir, identity: TEST_IDENTITY }), homeDir };
+  return { harness: createKimiHarness({ homeDir, identity: TEST_IDENTITY }), homeDir };
 }
 
 /** Whether the persisted session directory exists under `<home>/sessions/<bucket>/<id>`. */
@@ -119,6 +132,20 @@ async function sessionDirExists(homeDir: string, sessionId: string): Promise<boo
     }
   }
   return false;
+}
+
+/** The persisted session directory under `<home>/sessions/<bucket>/<id>`. */
+async function findSessionDir(homeDir: string, sessionId: string): Promise<string> {
+  for (const bucket of await readdir(join(homeDir, 'sessions'))) {
+    const candidate = join(homeDir, 'sessions', bucket, sessionId);
+    try {
+      await readdir(candidate);
+      return candidate;
+    } catch {
+      // Not under this bucket.
+    }
+  }
+  throw new Error(`no persisted directory found for session ${sessionId}`);
 }
 
 describe('SDKRpcClientV2 (agent-core-v2 wiring)', () => {
@@ -144,13 +171,6 @@ describe('SDKRpcClientV2 (agent-core-v2 wiring)', () => {
     const implicitOAuthUrl = 'https://implicit-oauth.example.test/mcp';
     const authorizedUrl = 'https://authorized.example.test/mcp';
     const requiredUrl = 'https://required.example.test/mcp';
-    const externalOAuth = new McpOAuthService({ kimiHomeDir: homeDir });
-    await externalOAuth
-      .getProvider('oauth-authorized', authorizedUrl)
-      .saveTokens({ access_token: 'test-access-token', token_type: 'Bearer' });
-    await externalOAuth
-      .getProvider('sse', implicitOAuthUrl)
-      .saveTokens({ access_token: 'stale-sse-token', token_type: 'Bearer' });
     await writeFile(
       join(homeDir, 'mcp.json'),
       JSON.stringify({
@@ -179,10 +199,19 @@ describe('SDKRpcClientV2 (agent-core-v2 wiring)', () => {
       }),
       'utf-8',
     );
-    const harness = createKimiHarnessV2({ homeDir, identity: TEST_IDENTITY });
+    const client = new SDKRpcClientV2({ homeDir, identity: TEST_IDENTITY });
+    const oauth = client.engineAccessor.get(IMcpOAuthService);
 
     try {
-      await expect(harness.listMcpServerAuthStatuses({ verify: false })).resolves.toEqual([
+      await client.engineAccessor.get(IAgentIdentity).resolved();
+      await oauth
+        .getProvider('oauth-authorized', authorizedUrl)
+        .saveTokens({ access_token: 'test-access-token', token_type: 'Bearer' });
+      await oauth
+        .getProvider('sse', implicitOAuthUrl)
+        .saveTokens({ access_token: 'stale-sse-token', token_type: 'Bearer' });
+
+      await expect(client.listGlobalMcpServerAuthStatuses({ verify: false })).resolves.toEqual([
         { name: 'stdio', authStatus: 'not-applicable' },
         { name: 'plain', authStatus: 'not-applicable' },
         { name: 'detected', authStatus: 'not-applicable' },
@@ -193,12 +222,12 @@ describe('SDKRpcClientV2 (agent-core-v2 wiring)', () => {
         { name: 'oauth-authorized', authStatus: 'oauth-authorized' },
       ]);
 
-      await externalOAuth
+      await oauth
         .getProvider('oauth-required', requiredUrl)
         .saveTokens({ access_token: 'new-test-access-token', token_type: 'Bearer' });
-      await externalOAuth.invalidate('oauth-authorized', authorizedUrl, 'tokens');
+      await oauth.invalidate('oauth-authorized', authorizedUrl, 'tokens');
 
-      await expect(harness.listMcpServerAuthStatuses({ verify: false })).resolves.toEqual([
+      await expect(client.listGlobalMcpServerAuthStatuses({ verify: false })).resolves.toEqual([
         { name: 'stdio', authStatus: 'not-applicable' },
         { name: 'plain', authStatus: 'not-applicable' },
         { name: 'detected', authStatus: 'not-applicable' },
@@ -209,7 +238,7 @@ describe('SDKRpcClientV2 (agent-core-v2 wiring)', () => {
         { name: 'oauth-authorized', authStatus: 'oauth-required' },
       ]);
     } finally {
-      await harness.close();
+      await client.close();
     }
   }, 15_000);
 
@@ -343,7 +372,7 @@ describe('SDKRpcClientV2 (agent-core-v2 wiring)', () => {
     try {
       const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-'));
       tempDirs.push(homeDir);
-      const harness = createKimiHarnessV2({ homeDir, identity: TEST_IDENTITY });
+      const harness = createKimiHarness({ homeDir, identity: TEST_IDENTITY });
       try {
         await expect(harness.ensureConfigFile()).rejects.toBeInstanceOf(HostProcessError);
         await expect(harness.ensureConfigFile()).rejects.toMatchObject({
@@ -364,7 +393,7 @@ describe('SDKRpcClientV2 (agent-core-v2 wiring)', () => {
     try {
       const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-'));
       tempDirs.push(homeDir);
-      const harness = createKimiHarnessV2({ homeDir, identity: TEST_IDENTITY });
+      const harness = createKimiHarness({ homeDir, identity: TEST_IDENTITY });
       try {
         await expect(harness.ensureConfigFile()).resolves.toBeUndefined();
       } finally {
@@ -445,9 +474,6 @@ describe('SDKRpcClientV2 (agent-core-v2 wiring)', () => {
       `
 default_model = "stub"
 
-[experimental]
-auto_session_title = true
-
 [providers.stub]
 type = "openai"
 base_url = "https://model.example.test/v1"
@@ -478,7 +504,7 @@ key = "${titleOAuthRef.key}"
       }
       throw new Error(`Unexpected fetch: ${url}`);
     });
-    const harness = createKimiHarnessV2({ homeDir, identity: TEST_IDENTITY });
+    const harness = createKimiHarness({ homeDir, identity: TEST_IDENTITY });
 
     try {
       const session = await harness.createSession({ id: 'ses_generated_title_event', workDir });
@@ -549,9 +575,6 @@ key = "${titleOAuthRef.key}"
       join(homeDir, 'config.toml'),
       `
 default_model = "stub"
-
-[experimental]
-auto_session_title = true
 
 [providers.stub]
 type = "openai"
@@ -700,7 +723,7 @@ key = "${titleOAuthRef.key}"
       ]);
 
       const outcomes = [first, second].map((result) => result.status);
-      expect(outcomes.sort()).toEqual(['fulfilled', 'rejected']);
+      expect(outcomes.toSorted()).toEqual(['fulfilled', 'rejected']);
       const rejection = [first, second].find((result) => result.status === 'rejected');
       expect((rejection as PromiseRejectedResult).reason).toMatchObject({
         code: 'session.already_exists',
@@ -778,6 +801,94 @@ key = "${titleOAuthRef.key}"
     }
   });
 
+  it('folds the resumed main agent replay from the persisted wire on cold and live resumes', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-resume-fold-'));
+    const workDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-work-'));
+    tempDirs.push(homeDir, workDir);
+    const client = new SDKRpcClientV2({ homeDir, identity: TEST_IDENTITY });
+
+    try {
+      await client.createSession({ id: 'ses_resume_fold', workDir });
+      await client.importContext({
+        sessionId: 'ses_resume_fold',
+        content: 'first imported turn',
+        source: "session 'source-a'",
+      });
+      await client.importContext({
+        sessionId: 'ses_resume_fold',
+        content: 'second imported turn',
+        source: "session 'source-b'",
+      });
+      await client.closeSession({ sessionId: 'ses_resume_fold' });
+      const sessionDir = await findSessionDir(homeDir, 'ses_resume_fold');
+      const wirePath = join(sessionDir, 'agents', MAIN_AGENT_ID, 'wire.jsonl');
+
+      // Cold resume with a turn window: the summary serves exactly the fold
+      // of the persisted wire, trimmed to the last user turn.
+      const limited = await client.resumeSession({ id: 'ses_resume_fold', replayTurnLimit: 1 });
+      const expectedLimited = await foldAgentWireReplay(wirePath, 1);
+      const limitedMain = limited.agents[MAIN_AGENT_ID];
+      expect(limitedMain?.replay).toEqual(expectedLimited.replay);
+      expect(limitedMain?.toolStore).toEqual(expectedLimited.toolStore);
+      expect(JSON.stringify(limitedMain?.replay)).toContain('second imported turn');
+      expect(JSON.stringify(limitedMain?.replay)).not.toContain('first imported turn');
+      expect(Object.keys(limited.agents)).toEqual([MAIN_AGENT_ID]);
+
+      // A live re-resume serves the same fold off the live scope.
+      const live = await client.resumeSession({ id: 'ses_resume_fold', replayTurnLimit: 1 });
+      expect(live.agents[MAIN_AGENT_ID]?.replay).toEqual(expectedLimited.replay);
+      await client.closeSession({ sessionId: 'ses_resume_fold' });
+
+      // Without a window the whole journal folds in.
+      const full = await client.resumeSession({ id: 'ses_resume_fold' });
+      const expectedFull = await foldAgentWireReplay(wirePath);
+      expect(full.agents[MAIN_AGENT_ID]?.replay).toEqual(expectedFull.replay);
+      expect(JSON.stringify(full.agents[MAIN_AGENT_ID]?.replay)).toContain('first imported turn');
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('rejects a resume whose engine restore fails without an unhandled rejection from the overlapped fold', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-resume-fail-'));
+    const workDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-work-'));
+    tempDirs.push(homeDir, workDir);
+    const client = new SDKRpcClientV2({ homeDir, identity: TEST_IDENTITY });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+
+    try {
+      await client.createSession({ id: 'ses_resume_fail', workDir });
+      await client.importContext({
+        sessionId: 'ses_resume_fail',
+        content: 'imported turn',
+        source: "session 'source-a'",
+      });
+      await client.closeSession({ sessionId: 'ses_resume_fail' });
+      // Malform the wire's metadata record: the engine's cold restore throws,
+      // while the index entry (and thus the overlapped fold's wire path)
+      // stays intact.
+      const sessionDir = await findSessionDir(homeDir, 'ses_resume_fail');
+      await writeFile(
+        join(sessionDir, 'agents', MAIN_AGENT_ID, 'wire.jsonl'),
+        '{"type":"metadata"}\n',
+        'utf-8',
+      );
+      await expect(client.resumeSession({ id: 'ses_resume_fail' })).rejects.toThrow(
+        'Agent wire metadata is malformed',
+      );
+      // The abandoned fold promise must settle quietly.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.removeListener('unhandledRejection', onUnhandled);
+      await client.close();
+    }
+  });
+
   it('serves listWorkspaceSkills through the engineAccessor escape hatch', async () => {
     const { harness, homeDir } = await makeHarness();
     const workDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-work-'));
@@ -800,6 +911,45 @@ key = "${titleOAuthRef.key}"
     }
   });
 
+  it('serves suggestFiles through the workspace handler fs service', async () => {
+    const { harness } = await makeHarness();
+    const workDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-work-'));
+    tempDirs.push(workDir);
+    await mkdir(join(workDir, 'src'), { recursive: true });
+    await writeFile(join(workDir, 'src', 'app.ts'), 'app');
+    await writeFile(join(workDir, 'src', 'index.ts'), 'index');
+    await writeFile(join(workDir, 'README.md'), 'readme');
+    try {
+      const matched = await harness.suggestFiles(workDir, { query: 'app', limit: 20 });
+      expect(matched?.items).toContainEqual(
+        expect.objectContaining({ kind: 'file', path: 'src/app.ts', name: 'app.ts' }),
+      );
+      const appItem = matched?.items.find((item) => item.name === 'app.ts');
+      expect(appItem?.matchPositions.length).toBeGreaterThan(0);
+
+      const topLevel = await harness.suggestFiles(workDir, { query: '', limit: 20 });
+      expect(topLevel?.items).toContainEqual(expect.objectContaining({ kind: 'directory', name: 'src' }));
+      expect(topLevel?.items).toContainEqual(expect.objectContaining({ kind: 'file', name: 'README.md' }));
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('rejects an out-of-range suggestFiles limit before touching the engine', async () => {
+    const { harness } = await makeHarness();
+    const workDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-work-'));
+    tempDirs.push(workDir);
+    try {
+      for (const limit of [0, -1, 201, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+        await expect(harness.suggestFiles(workDir, { query: 'a', limit })).rejects.toMatchObject({
+          code: ErrorCodes.REQUEST_INVALID,
+        });
+      }
+    } finally {
+      await harness.close();
+    }
+  });
+
   it('honors skillDirs (explicit dirs) over default user / project discovery', async () => {
     const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-'));
     tempDirs.push(homeDir);
@@ -811,7 +961,7 @@ key = "${titleOAuthRef.key}"
     await writeSkill(join(homeDir, 'skills', 'demo-user-skill'), 'demo-user-skill');
     await writeSkill(join(workDir, '.kimi-code', 'skills', 'demo-project-skill'), 'demo-project-skill');
     await writeSkill(join(explicitDir, 'demo-explicit-skill'), 'demo-explicit-skill');
-    const harness = createKimiHarnessV2({
+    const harness = createKimiHarness({
       homeDir,
       identity: TEST_IDENTITY,
       skillDirs: [explicitDir],
@@ -886,7 +1036,7 @@ key = "${titleOAuthRef.key}"
     }
   });
 
-  it('cascades removeProvider into the secondary_model pool', async () => {
+  it('leaves the secondary_model pool untouched on removeProvider', async () => {
     const { harness } = await makeHarness();
     try {
       await harness.setConfig({
@@ -904,24 +1054,30 @@ key = "${titleOAuthRef.key}"
         },
       });
 
-      // Pool entries naming a removed model alias are filtered out; the
-      // surviving default keeps the section valid.
-      const filtered = await harness.removeProvider('b');
-      expect(filtered.secondaryModel).toEqual({
+      // Pool entries naming a removed model alias are kept as written; an
+      // unresolvable entry fails pool validation on the next session create.
+      const kept = await harness.removeProvider('b');
+      expect(kept.secondaryModel).toEqual({
         defaultModel: 'a/m1',
-        models: { 'a/m1': 'fast' },
+        models: { 'a/m1': 'fast', 'b/m1': 'smart' },
       });
 
-      // When the pool's default dangles the whole section is dropped — a
-      // leftover models table without its default would fail pool validation
-      // on every session create.
+      // Even a dangling default leaves the whole section in place on disk.
+      // (`setConfig` merges per domain, so the pool table is still the one
+      // written above; the default now points at the provider being removed.)
       await harness.setConfig({
-        secondaryModel: { defaultModel: 'a/m1', models: { 'a/m1': 'fast' } },
+        secondaryModel: { defaultModel: 'a/m1' },
       });
       const cleared = await harness.removeProvider('a');
-      expect(cleared.secondaryModel).toBeUndefined();
+      expect(cleared.secondaryModel).toEqual({
+        defaultModel: 'a/m1',
+        models: { 'a/m1': 'fast', 'b/m1': 'smart' },
+      });
       const reread = await harness.getConfig({ reload: true });
-      expect(reread.secondaryModel).toBeUndefined();
+      expect(reread.secondaryModel).toEqual({
+        defaultModel: 'a/m1',
+        models: { 'a/m1': 'fast', 'b/m1': 'smart' },
+      });
     } finally {
       await harness.close();
     }
@@ -942,6 +1098,34 @@ key = "${titleOAuthRef.key}"
       // Sections absent from the write stay untouched.
       expect(next.providers['a']).toBeDefined();
       expect(next.models?.['a/m1']).toBeDefined();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('imports a registry through the harness without selecting a default when the caller defers selection', async () => {
+    setModelsDevUpstreamForTest({
+      fetchImpl: async () => Response.json({
+        example: {
+          id: 'example',
+          name: 'Example',
+          type: 'openai',
+          api: 'https://api.example.test/v1',
+          models: { m1: { id: 'm1' } },
+        },
+      }),
+    });
+    const { harness } = await makeHarness();
+    try {
+      const result = await harness.importCustomRegistry({
+        url: 'https://registry.example.test/api.json',
+        setDefaultWhenUnset: false,
+      });
+      expect(result.modelsImported).toBe(1);
+      const config = await harness.getConfig({ reload: true });
+      expect(config.providers['example']).toMatchObject({ type: 'openai', apiKey: '' });
+      expect(config.models?.['example/m1']).toMatchObject({ provider: 'example', model: 'm1' });
+      expect(config.defaultModel).toBeUndefined();
     } finally {
       await harness.close();
     }
@@ -973,6 +1157,21 @@ key = "${titleOAuthRef.key}"
     }
   });
 
+  it('round-trips autoSessionTitle to the auto_session_title config.toml field', async () => {
+    const { harness, homeDir } = await makeHarness();
+    try {
+      await harness.setConfig({ autoSessionTitle: false });
+
+      const toml = await readFile(join(homeDir, 'config.toml'), 'utf-8');
+      expect(toml).toContain('auto_session_title = false');
+
+      const reread = await harness.getConfig({ reload: true });
+      expect(reread.autoSessionTitle).toBe(false);
+    } finally {
+      await harness.close();
+    }
+  });
+
   it('deleteSession removes a session and rejects a missing id with session_not_found', async () => {
     const { harness, homeDir } = await makeHarness();
     const workDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-work-'));
@@ -992,6 +1191,168 @@ key = "${titleOAuthRef.key}"
     }
   });
 
+  it.each([
+    { enabled: false, panel: true },
+    { enabled: true, panel: false },
+    { enabled: true, panel: true },
+  ])(
+    'gates NotifyUser for all profiles and preserves fork prompts: %j',
+    async ({ enabled, panel }) => {
+      vi.stubEnv('KIMI_CODE_EXPERIMENTAL_FLAG', '0');
+      vi.stubEnv('KIMI_CODE_EXPERIMENTAL_NOTIFY_USER', '');
+      const homeDir = await mkdtemp(join(tmpdir(), 'kimi-notify-home-'));
+      const workDir = await mkdtemp(join(tmpdir(), 'kimi-notify-work-'));
+      tempDirs.push(homeDir, workDir);
+      const client = new SDKRpcClientV2({
+        homeDir,
+        identity: TEST_IDENTITY,
+        uiCapabilities: panel ? ['update_panel'] : [],
+      });
+      try {
+        await client.setConfig({
+          providers: {
+            stub: {
+              type: 'openai',
+              baseUrl: 'https://model.example.test/v1',
+              apiKey: 'YOUR_API_KEY',
+            },
+          },
+          models: { stub: { provider: 'stub', model: 'stub', maxContextSize: 32000 } },
+          defaultModel: 'stub',
+          experimental: { notify_user: enabled },
+        });
+        await client.createSession({ id: 'ses_notify', workDir });
+        const session = getLiveSessionById(client.engineAccessor, 'ses_notify')!;
+        const lifecycle = session.accessor.get(IAgentLifecycleService);
+        for (const profile of ['agent', 'coder', 'explore', 'plan']) {
+          const id = profile === 'agent' ? 'main' : `worker-${profile}`;
+          if (lifecycle.get(id) === undefined)
+            await lifecycle.create({ agentId: id, binding: { profile, model: 'stub' } });
+          const agent = lifecycle.handleOf(id)!;
+          await agent.accessor.get(IAgentToolActivationService).activate();
+          const offered = agent.accessor
+            .get(IAgentToolRegistryService)
+            .list()
+            .some((tool) => tool.name === 'NotifyUser');
+          expect(offered).toBe(enabled && panel);
+          if (profile === 'agent') {
+            const delegation = agent.accessor
+              .get(IAgentToolRegistryService)
+              .list()
+              .find((tool) => tool.name === 'Agent');
+            expect(delegation?.description.includes('NotifyUser')).toBe(enabled && panel);
+          }
+          const prompt = agent.accessor.get(IAgentProfileService).getSystemPrompt();
+          expect(prompt.includes('When `NotifyUser` is available')).toBe(enabled && panel);
+          if (offered) {
+            expect(
+              agent.accessor
+                .get(INotifyUserTool)
+                .resolveExecution({ message: 'Checking this subtask.' }),
+            ).toMatchObject({ accesses: [], approvalRule: 'NotifyUser' });
+          }
+        }
+        const main = lifecycle.handleOf('main')!;
+        const originalPrompt = main.accessor.get(IAgentProfileService).getSystemPrompt();
+        const fork = await lifecycle.fork(lifecycle.get('main')!, { agentId: 'fork-worker' });
+        expect(
+          lifecycle.handleOf(fork.agentId)!.accessor.get(IAgentProfileService).getSystemPrompt(),
+        ).toBe(originalPrompt);
+        const originalTools = structuredClone(main.accessor.get(IAgentToolRegistryService).list());
+        for (const [index, nextEnabled] of [!enabled, enabled, !enabled].entries()) {
+          await client.setConfig({ experimental: { notify_user: nextEnabled } });
+          let current = getLiveSessionById(client.engineAccessor, 'ses_notify')!;
+          let currentMain = current.accessor.get(IAgentLifecycleService).handleOf('main')!;
+          expect(currentMain.accessor.get(IAgentProfileService).getSystemPrompt()).toBe(
+            originalPrompt,
+          );
+          expect(currentMain.accessor.get(IAgentToolRegistryService).list()).toEqual(originalTools);
+          if (enabled && panel) {
+            const execution = currentMain.accessor
+              .get(INotifyUserTool)
+              .resolveExecution({ message: 'Still working.' });
+            if (!('execute' in execution)) throw new Error('Expected executable notification');
+            expect(
+              await execution.execute({ signal: new AbortController().signal } as never),
+            ).toEqual({
+              isError: false,
+              output: nextEnabled
+                ? 'Update shown to the user.'
+                : 'Notifications are disabled; the update was not displayed.',
+            });
+          }
+          await current.accessor.get(IAgentLifecycleService).create({
+            agentId: `late-worker-${index}`,
+            binding: { profile: 'coder', model: 'stub' },
+          });
+          const child = current.accessor
+            .get(IAgentLifecycleService)
+            .handleOf(`late-worker-${index}`)!;
+          expect(
+            child.accessor
+              .get(IAgentToolRegistryService)
+              .list()
+              .some((tool) => tool.name === 'NotifyUser'),
+          ).toBe(enabled && panel);
+          expect(
+            child.accessor
+              .get(IAgentProfileService)
+              .getSystemPrompt()
+              .includes('When `NotifyUser` is available'),
+          ).toBe(enabled && panel);
+          await client.reloadSession({ sessionId: 'ses_notify' });
+          current = getLiveSessionById(client.engineAccessor, 'ses_notify')!;
+          currentMain = current.accessor.get(IAgentLifecycleService).handleOf('main')!;
+          expect(currentMain.accessor.get(IAgentToolRegistryService).list()).toEqual(originalTools);
+          expect(currentMain.accessor.get(IAgentProfileService).getSystemPrompt()).toBe(
+            originalPrompt,
+          );
+        }
+        await client.createSession({ id: 'ses_notify_fresh', workDir });
+        await client.setConfig({ experimental: { notify_user: enabled } });
+        await client.getStatus({ sessionId: 'ses_notify_fresh' });
+        const fresh = getLiveSessionById(client.engineAccessor, 'ses_notify_fresh')!
+          .accessor.get(IAgentLifecycleService)
+          .handleOf('main')!;
+        expect(
+          fresh.accessor
+            .get(IAgentToolRegistryService)
+            .list()
+            .some((tool) => tool.name === 'NotifyUser'),
+        ).toBe(!enabled && panel);
+        expect(
+          fresh.accessor
+            .get(IAgentProfileService)
+            .getSystemPrompt()
+            .includes('When `NotifyUser` is available'),
+        ).toBe(!enabled && panel);
+        if (enabled || !panel) {
+          expect(fresh.accessor.get(IAgentProfileService).getSystemPrompt()).not.toContain(
+            'NotifyUser',
+          );
+          expect(
+            JSON.stringify(fresh.accessor.get(IAgentToolRegistryService).list()),
+          ).not.toContain('NotifyUser');
+        }
+        await client.setConfig({ experimental: { notify_user: !enabled } });
+        const legacy = getLiveSessionById(client.engineAccessor, 'ses_notify')!;
+        await legacy.accessor
+          .get(IAtomicDocumentStore)
+          .delete(legacy.accessor.get(ISessionContext).scope('notify'), 'state.json');
+        await client.reloadSession({ sessionId: 'ses_notify' });
+        const migrated = getLiveSessionById(client.engineAccessor, 'ses_notify')!
+          .accessor.get(IAgentLifecycleService)
+          .handleOf('main')!;
+        expect(migrated.accessor.get(IAgentProfileService).getSystemPrompt()).toBe(originalPrompt);
+        expect(migrated.accessor.get(IAgentToolRegistryService).list()).toEqual(originalTools);
+      } finally {
+        await client.close();
+        vi.unstubAllEnvs();
+      }
+    },
+    30_000,
+  );
+
   it('serves getTodos from the live session todo state', async () => {
     const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-'));
     tempDirs.push(homeDir);
@@ -1005,8 +1366,8 @@ key = "${titleOAuthRef.key}"
       const handle = getLiveSessionById(client.engineAccessor, 'ses_todos');
       expect(handle).toBeDefined();
       const manager = handle!.accessor.get(IAgentLifecycleService);
-      const main = await manager.create({ agentId: 'main' });
-      const todo = manager.resolve(main, AgentTodo);
+      await manager.create({ agentId: 'main' });
+      const todo = manager.handleOf('main')!.accessor.get(IAgentTodoService);
       await todo.replace([
         { title: 'write tests', status: 'in_progress' },
         { title: 'ship it', status: 'pending' },
@@ -1049,8 +1410,8 @@ key = "${titleOAuthRef.key}"
       };
 
       await client.setTowerMode({ sessionId: 'ses_tower', enabled: true });
-      // The tower feature is flag-gated engine-side, so enter() may be a
-      // no-op; the wire must always mirror the engine truth.
+      // A refused enter() rejects with a typed reason, so a resolved call
+      // means the engine activated tower mode; the wire mirrors it.
       expect((await client.getStatus({ sessionId: 'ses_tower' })).towerMode).toBe(
         mainTower().isActive,
       );
@@ -1069,6 +1430,7 @@ key = "${titleOAuthRef.key}"
   });
 
   it('rejects setTowerMode when the tower feature is unavailable', async () => {
+    vi.stubEnv('KIMI_CODE_EXPERIMENTAL_TOWER', '0');
     vi.stubEnv('KIMI_CODE_EXPERIMENTAL_FLAG', '0');
     const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-'));
     tempDirs.push(homeDir);
@@ -1079,7 +1441,10 @@ key = "${titleOAuthRef.key}"
       await client.createSession({ id: 'ses_tower_off', workDir });
 
       await expect(client.setTowerMode({ sessionId: 'ses_tower_off', enabled: true }))
-        .rejects.toMatchObject({ code: 'session.tower_mode_invalid' });
+        .rejects.toMatchObject({
+          code: 'session.tower_mode_invalid',
+          message: expect.stringContaining('the tower experiment is disabled'),
+        });
       expect((await client.getStatus({ sessionId: 'ses_tower_off' })).towerMode).toBe(false);
 
       await client.setTowerMode({ sessionId: 'ses_tower_off', enabled: false });
@@ -1158,6 +1523,47 @@ describe('SDKRpcClientV2 workspace trust', () => {
       expect(serialized).not.toContain('hidden');
       expect(serialized).not.toContain('SECRET');
       expect(serialized).not.toContain('TOKEN');
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('reports project servers that override same-named user entries', async () => {
+    const { harness, homeDir } = await makeHarness();
+    const workDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-work-'));
+    tempDirs.push(workDir);
+    await writeFile(
+      join(homeDir, 'mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          github: { command: 'user-github', enabled: false },
+        },
+      }),
+      'utf-8',
+    );
+    await writeFile(
+      join(workDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          github: { command: 'project-github', enabled: false },
+          toString: { transport: 'http', url: 'https://example.test/mcp', enabled: false },
+        },
+      }),
+      'utf-8',
+    );
+    try {
+      const info = await harness.getWorkspaceTrustInfo(workDir);
+      expect(info.trusted).toBe(false);
+      expect(info.gatedMcpServers).toEqual([
+        {
+          name: 'github',
+          transport: 'stdio',
+          command: 'project-github',
+          args: undefined,
+          cwd: workDir,
+        },
+        { name: 'toString', transport: 'http', url: 'https://example.test/mcp' },
+      ]);
     } finally {
       await harness.close();
     }
@@ -1265,6 +1671,337 @@ describe('foldAgentWireReplay', () => {
   });
 });
 
+describe('foldAgentWireReplay turn limiting', () => {
+  function appendUser(
+    text: string,
+    time: number,
+    origin?: Record<string, unknown>,
+  ): Record<string, unknown> {
+    return {
+      type: 'context.append_message',
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text }],
+        toolCalls: [],
+        ...(origin === undefined ? {} : { origin }),
+      },
+      time,
+    };
+  }
+
+  function stepRecords(
+    uuid: string,
+    time: number,
+    opts: { readonly withTool?: boolean; readonly text?: string } = {},
+  ): Record<string, unknown>[] {
+    const records: Record<string, unknown>[] = [
+      { type: 'context.append_loop_event', event: { type: 'step.begin', uuid }, time },
+      {
+        type: 'context.append_loop_event',
+        event: {
+          type: 'content.part',
+          stepUuid: uuid,
+          part: { type: 'text', text: opts.text ?? `answer ${uuid}` },
+        },
+        time: time + 1,
+      },
+    ];
+    if (opts.withTool === true) {
+      records.push(
+        {
+          type: 'context.append_loop_event',
+          event: {
+            type: 'tool.call',
+            stepUuid: uuid,
+            toolCallId: `call-${uuid}`,
+            name: 'Bash',
+            args: { command: 'ls' },
+          },
+          time: time + 2,
+        },
+        {
+          type: 'context.append_loop_event',
+          event: {
+            type: 'tool.result',
+            toolCallId: `call-${uuid}`,
+            result: { output: 'ok', isError: false },
+          },
+          time: time + 3,
+        },
+        { type: 'context.append_loop_event', event: { type: 'step.end', uuid }, time: time + 4 },
+      );
+    } else {
+      records.push({
+        type: 'context.append_loop_event',
+        event: { type: 'step.end', uuid },
+        time: time + 2,
+      });
+    }
+    return records;
+  }
+
+  function turnRecords(index: number, time: number): Record<string, unknown>[] {
+    return [
+      appendUser(`prompt ${index}`, time),
+      ...stepRecords(`s${index}`, time + 1, { withTool: index % 3 === 0 }),
+    ];
+  }
+
+  async function writeWire(records: readonly Record<string, unknown>[]): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-fold-limit-'));
+    tempDirs.push(dir);
+    const wirePath = join(dir, 'wire.jsonl');
+    await writeFile(
+      wirePath,
+      records.map((record) => JSON.stringify(record)).join('\n') + '\n',
+      'utf-8',
+    );
+    return wirePath;
+  }
+
+  async function referenceFold(wirePath: string, turnLimit?: number) {
+    const full = await foldAgentWireReplay(wirePath);
+    return {
+      replay: limitAgentReplayByTurns(full.replay, turnLimit),
+      toolStore: full.toolStore,
+    };
+  }
+
+  it('matches the unlimited fold truncated to the last N turns on a rich journal', async () => {
+    const records: Record<string, unknown>[] = [
+      { type: 'metadata', protocol_version: '1.5', created_at: 1 },
+      { type: 'config.update', modelAlias: 'm1', thinkingEffort: 'high', time: 2 },
+      { type: 'permission.set_mode', mode: 'auto', time: 3 },
+      { type: 'goal.create', goalId: 'g1', objective: 'ship it', time: 4 },
+      {
+        type: 'tools.update_store',
+        key: 'todo',
+        value: [{ title: 'early', status: 'pending' }],
+        time: 5,
+      },
+    ];
+    let time = 100;
+    for (let index = 0; index < 15; index++) {
+      records.push(...turnRecords(index, time));
+      time += 10;
+      records.push({
+        type: 'goal.update',
+        status: 'active',
+        turnsUsed: index + 1,
+        tokensUsed: (index + 1) * 100,
+        wallClockMs: (index + 1) * 1000,
+        time: time++,
+      });
+      if (index === 5) {
+        records.push({
+          type: 'tools.update_store',
+          key: 'todo',
+          value: [{ title: 'mid', status: 'done' }],
+          time: time++,
+        });
+      }
+      if (index === 7) {
+        records.push(
+          { type: 'plan_mode.enter', time: time++ },
+          { type: 'plan_mode.exit', time: time++ },
+        );
+      }
+      if (index === 9 || index === 13) {
+        records.push(
+          { type: 'full_compaction.begin', instruction: 'compact', time: time++ },
+          {
+            type: 'context.apply_compaction',
+            summary: 'summary',
+            contextSummary: 'context summary',
+            compactedCount: 3,
+            tokensBefore: 1000,
+            tokensAfter: 100,
+            keptUserMessageCount: 2,
+            time: time++,
+          },
+        );
+      }
+      if (index === 12) {
+        records.push({ type: 'forked', time: time++ });
+      }
+    }
+    records.push({
+      type: 'tools.update_store',
+      key: 'todo',
+      value: [{ title: 'final', status: 'done' }],
+      time: time++,
+    });
+    const wirePath = await writeWire(records);
+    for (const limit of [1, 3, 11, 15, 16]) {
+      expect(await foldAgentWireReplay(wirePath, limit)).toEqual(
+        await referenceFold(wirePath, limit),
+      );
+    }
+  });
+
+  it('matches the reference on a legacy-version journal with goal usage records', async () => {
+    const records: Record<string, unknown>[] = [
+      { type: 'metadata', protocol_version: '1.3', created_at: 1 },
+      { type: 'goal.create', goalId: 'g1', objective: 'legacy goal', time: 2 },
+      { type: 'goal.account_usage', goalId: 'g1', tokensUsed: 42, wallClockMs: 900, time: 3 },
+      { type: 'goal.continuation', goalId: 'g1', turnsUsed: 7, time: 4 },
+    ];
+    let time = 100;
+    for (let index = 0; index < 6; index++) {
+      records.push(...turnRecords(index, time));
+      time += 10;
+    }
+    records.push({
+      type: 'goal.update',
+      goalId: 'g1',
+      status: 'complete',
+      reason: 'done',
+      turnsUsed: 8,
+      time: time++,
+    });
+    const wirePath = await writeWire(records);
+    expect(await foldAgentWireReplay(wirePath, 2)).toEqual(await referenceFold(wirePath, 2));
+  });
+
+  it('shifts the window across undo-erased turns exactly like the reference', async () => {
+    const records: Record<string, unknown>[] = [
+      { type: 'metadata', protocol_version: '1.5', created_at: 1 },
+    ];
+    let time = 100;
+    for (let index = 0; index < 14; index++) {
+      records.push(...turnRecords(index, time));
+      time += 10;
+    }
+    records.push(
+      appendUser('cron fire', time++, {
+        kind: 'cron_job',
+        jobId: 'job-1',
+        cron: '*/15 * * * *',
+        recurring: true,
+        coalescedCount: 1,
+        stale: false,
+      }),
+      ...stepRecords('cron-step', time, {}),
+    );
+    time += 10;
+    records.push({ type: 'context.undo', count: 2, time: time++ });
+    const wirePath = await writeWire(records);
+    for (const limit of [5, 11, 12, 13]) {
+      expect(await foldAgentWireReplay(wirePath, limit)).toEqual(
+        await referenceFold(wirePath, limit),
+      );
+    }
+  });
+
+  it('reproduces a tool call pending across the turn boundary', async () => {
+    const records: Record<string, unknown>[] = [
+      { type: 'metadata', protocol_version: '1.5', created_at: 1 },
+    ];
+    let time = 100;
+    for (let index = 0; index < 3; index++) {
+      records.push(...turnRecords(index, time));
+      time += 10;
+    }
+    records.push(
+      { type: 'context.append_loop_event', event: { type: 'step.begin', uuid: 'sx' }, time: time++ },
+      {
+        type: 'context.append_loop_event',
+        event: { type: 'tool.call', stepUuid: 'sx', toolCallId: 'call-x', name: 'Bash', args: {} },
+        time: time++,
+      },
+      appendUser('prompt while pending', time++),
+      { type: 'context.append_loop_event', event: { type: 'step.begin', uuid: 'sy' }, time: time++ },
+      {
+        type: 'context.append_loop_event',
+        event: {
+          type: 'content.part',
+          stepUuid: 'sy',
+          part: { type: 'text', text: 'recovered' },
+        },
+        time: time++,
+      },
+      { type: 'context.append_loop_event', event: { type: 'step.end', uuid: 'sy' }, time: time++ },
+    );
+    const wirePath = await writeWire(records);
+    for (const limit of [1, 2, 4]) {
+      expect(await foldAgentWireReplay(wirePath, limit)).toEqual(
+        await referenceFold(wirePath, limit),
+      );
+    }
+  });
+
+  it('falls back to a full fold when a legacy compaction lands inside the window', async () => {
+    const records: Record<string, unknown>[] = [
+      { type: 'metadata', protocol_version: '1.5', created_at: 1 },
+    ];
+    let time = 100;
+    for (let index = 0; index < 11; index++) {
+      if (index === 8) {
+        records.push(
+          { type: 'full_compaction.begin', instruction: 'compact', time: time++ },
+          {
+            type: 'context.apply_compaction',
+            summary: 'legacy summary',
+            compactedCount: 2,
+            tokensBefore: 5000,
+            time: time++,
+          },
+        );
+      }
+      records.push(...turnRecords(index, time));
+      time += 10;
+    }
+    const wirePath = await writeWire(records);
+    for (const limit of [1, 3]) {
+      expect(await foldAgentWireReplay(wirePath, limit)).toEqual(
+        await referenceFold(wirePath, limit),
+      );
+    }
+  });
+
+  it('returns the full replay when the journal has fewer turns than the limit', async () => {
+    const records: Record<string, unknown>[] = [
+      { type: 'metadata', protocol_version: '1.5', created_at: 1 },
+      { type: 'permission.set_mode', mode: 'auto', time: 2 },
+      ...turnRecords(0, 100),
+      ...turnRecords(1, 200),
+    ];
+    const wirePath = await writeWire(records);
+    expect(await foldAgentWireReplay(wirePath, 11)).toEqual(await referenceFold(wirePath, 11));
+  });
+
+  it('returns an empty replay but the full tool store for a zero turn limit', async () => {
+    const records: Record<string, unknown>[] = [
+      { type: 'metadata', protocol_version: '1.5', created_at: 1 },
+      { type: 'tools.update_store', key: 'todo', value: [{ title: 'kept', status: 'done' }], time: 2 },
+      ...turnRecords(0, 100),
+      ...turnRecords(1, 200),
+    ];
+    const wirePath = await writeWire(records);
+    expect(await foldAgentWireReplay(wirePath, 0)).toEqual(await referenceFold(wirePath, 0));
+  });
+
+  it('tolerates a truncated tail line with a turn limit and degrades like the reference', async () => {
+    const records: Record<string, unknown>[] = [
+      { type: 'metadata', protocol_version: '1.5', created_at: 1 },
+      ...turnRecords(0, 100),
+      ...turnRecords(1, 200),
+      ...turnRecords(2, 300),
+    ];
+    const wirePath = await writeWire(records);
+    await writeFile(
+      wirePath,
+      records.map((record) => JSON.stringify(record)).join('\n') + '\n{"type":"context.append_messa',
+      'utf-8',
+    );
+    expect(await foldAgentWireReplay(wirePath, 2)).toEqual(await referenceFold(wirePath, 2));
+    await expect(foldAgentWireReplay(join(wirePath, '..', 'missing.jsonl'), 2)).resolves.toEqual({
+      replay: [],
+      toolStore: {},
+    });
+  });
+});
+
 describe('SDKRpcClientV2 engine telemetry', () => {
   it('forwards engine-side events to the host-supplied telemetry client', async () => {
     const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-tel-'));
@@ -1272,7 +2009,7 @@ describe('SDKRpcClientV2 engine telemetry', () => {
     const workDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-tel-work-'));
     tempDirs.push(workDir);
     const records: TelemetryRecord[] = [];
-    const harness = createKimiHarnessV2({
+    const harness = createKimiHarness({
       homeDir,
       identity: TEST_IDENTITY,
       telemetry: recordingTelemetry(records),
@@ -1294,7 +2031,7 @@ describe('SDKRpcClientV2 engine telemetry', () => {
     tempDirs.push(workDir);
     await writeFile(join(homeDir, 'config.toml'), 'telemetry = false\n', 'utf-8');
     const records: TelemetryRecord[] = [];
-    const harness = createKimiHarnessV2({
+    const harness = createKimiHarness({
       homeDir,
       identity: TEST_IDENTITY,
       telemetry: recordingTelemetry(records),
@@ -1306,6 +2043,82 @@ describe('SDKRpcClientV2 engine telemetry', () => {
       await session.close();
     } finally {
       await harness.close();
+    }
+  });
+
+  it('emits session_started once per open, with the harness schema and enabled experimental flags', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-tel-flags-'));
+    tempDirs.push(homeDir);
+    const workDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-tel-flags-work-'));
+    tempDirs.push(workDir);
+    await writeFile(join(homeDir, 'config.toml'), '[experimental]\nsubagent_fork = true\n', 'utf-8');
+    const records: TelemetryRecord[] = [];
+    const harness = createKimiHarness({
+      homeDir,
+      identity: TEST_IDENTITY,
+      telemetry: recordingTelemetry(records),
+    });
+    try {
+      const session = await harness.createSession({ workDir });
+      // The harness row is the sole producer: the forwarding appender drops
+      // the engine's own session_started, or every open would double-count.
+      const started = records.filter((record) => record.event === 'session_started');
+      expect(started).toHaveLength(1);
+      expect(started[0]).toMatchObject({
+        sessionId: session.id,
+        properties: {
+          client_id: '',
+          client_name: 'kimi-code-cli',
+          client_version: '0.0.0-test',
+          ui_mode: 'shell',
+          resumed: false,
+        },
+      });
+      for (const record of started) {
+        const flags = String(record.properties?.['experimental_flags'] ?? '').split(',');
+        expect(flags).toContain('subagent_fork');
+        expect(flags).toContain('wait_for');
+      }
+      await session.close();
+      await harness.resumeSession({ id: session.id });
+      const afterResume = records.filter((record) => record.event === 'session_started');
+      expect(afterResume).toHaveLength(2);
+      expect(afterResume[1]).toMatchObject({
+        sessionId: session.id,
+        properties: { resumed: true },
+      });
+      const distinct = new Set(afterResume.map((record) => record.properties?.['experimental_flags']));
+      expect(distinct.size).toBe(1);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('keeps forwarding the engine session_started to a direct SDKRpcClientV2 consumer', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-tel-direct-'));
+    tempDirs.push(homeDir);
+    const workDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-tel-direct-work-'));
+    tempDirs.push(workDir);
+    const records: TelemetryRecord[] = [];
+    const client = new SDKRpcClientV2({
+      homeDir,
+      identity: TEST_IDENTITY,
+      telemetry: recordingTelemetry(records),
+    });
+    try {
+      // No harness wraps this client, so nothing else emits session_started —
+      // the engine's own row must survive forwarding.
+      const summary = await client.createSession({ workDir });
+      const started = records.filter((record) => record.event === 'session_started');
+      expect(started).toHaveLength(1);
+      expect(started[0]).toMatchObject({ properties: { resumed: false } });
+      await client.closeSession({ sessionId: summary.id });
+      await client.resumeSession({ id: summary.id });
+      const afterResume = records.filter((record) => record.event === 'session_started');
+      expect(afterResume).toHaveLength(2);
+      expect(afterResume[1]).toMatchObject({ properties: { resumed: true } });
+    } finally {
+      await client.close();
     }
   });
 });
@@ -1360,7 +2173,7 @@ describe('removeProviderFromConfig', () => {
     expect(next.defaultProvider).toBe('a');
   });
 
-  it('filters secondary_model pool entries whose model alias was removed', () => {
+  it('leaves secondary_model pool entries alone when their model alias was removed', () => {
     const config = {
       providers: { a: { type: 'openai' }, b: { type: 'openai' } },
       models: {
@@ -1377,11 +2190,11 @@ describe('removeProviderFromConfig', () => {
 
     expect(next.secondaryModel).toEqual({
       defaultModel: 'a/m1',
-      models: { 'a/m1': 'fast' },
+      models: { 'a/m1': 'fast', 'b/m1': 'smart' },
     });
   });
 
-  it('drops the secondary_model section when its default model dangles', () => {
+  it('keeps the secondary_model section even when its default model dangles', () => {
     const config = {
       providers: { a: { type: 'openai' }, b: { type: 'openai' } },
       models: {
@@ -1394,15 +2207,20 @@ describe('removeProviderFromConfig', () => {
       },
     } as unknown as KimiConfig;
 
-    expect(removeProviderFromConfig(config, 'b').secondaryModel).toBeUndefined();
+    expect(removeProviderFromConfig(config, 'b').secondaryModel).toEqual({
+      defaultModel: 'b/m1',
+      models: { 'a/m1': 'fast', 'b/m1': 'smart' },
+    });
 
-    // The legacy recipe's `model` key acts as the default fallback and
-    // cascades the same way.
+    // The legacy recipe's `model` key is left alone the same way.
     const legacy = {
       ...config,
       secondaryModel: { model: 'b/m1', default_effort: 'low' },
     } as unknown as KimiConfig;
-    expect(removeProviderFromConfig(legacy, 'b').secondaryModel).toBeUndefined();
+    expect(removeProviderFromConfig(legacy, 'b').secondaryModel).toEqual({
+      model: 'b/m1',
+      default_effort: 'low',
+    });
   });
 
   it('leaves the secondary_model section untouched when nothing dangles', () => {

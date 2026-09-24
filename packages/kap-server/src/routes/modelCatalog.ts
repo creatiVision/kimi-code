@@ -13,7 +13,8 @@ import {
   type ProvidersSection,
   type Scope,
 } from '@moonshot-ai/agent-core-v2';
-import { setDefaultModelResponseSchema } from '@moonshot-ai/agent-core-v2/kosong/model/catalog';
+import { reconcileProviderCredentialUpdate } from '@moonshot-ai/kimi-code-oauth/provider-credential';
+import { setDefaultModelResponseSchema } from '@moonshot-ai/agent-core-v2/llm-adapter/model/catalog';
 import { refreshProviderModelsResponseSchema } from '@moonshot-ai/agent-core-v2/app/kosongConfig/discovery';
 import {
   DEFAULT_MODEL_SECTION,
@@ -21,11 +22,6 @@ import {
   MODELS_SECTION,
   PROVIDERS_SECTION,
 } from '@moonshot-ai/agent-core-v2/app/kosongConfig/configSection';
-import {
-  SECONDARY_MODEL_SECTION,
-  cascadeSubagentModelPool,
-  type SecondaryModelConfig,
-} from '@moonshot-ai/agent-core-v2/session/subagent/configSection';
 import { z } from 'zod';
 
 import { errEnvelope, okEnvelope } from '../envelope';
@@ -198,9 +194,9 @@ export function registerModelCatalogRoutes(app: ModelCatalogRouteHost, core: Sco
         }
         const result = await (await loadCatalog(core)).setDefaultModel(parsed.id);
         reply.send(okEnvelope(result, req.id));
-      } catch (err) {
-        if (sendMappedError(reply, req.id, err)) return;
-        throw err;
+      } catch (error) {
+        if (sendMappedError(reply, req.id, error)) return;
+        throw error;
       }
     },
   );
@@ -240,7 +236,7 @@ export function registerModelCatalogRoutes(app: ModelCatalogRouteHost, core: Sco
         [ErrorCode.PROVIDER_ALREADY_EXISTS]: {},
       },
       description:
-        'Create a provider manually (type + credentials + model list). When no global default_model is configured (fresh setup), it is seeded with the new provider default (or first) model; an existing default is never modified.',
+        'Create a provider manually (type + credentials + model list). Credentials are either `api_key` (stored inline) or `api_key_env` (name of an environment variable to read the key from); they are mutually exclusive — submitting both fails validation. When no global default_model is configured (fresh setup), it is seeded with the new provider default (or first) model; an existing default is never modified.',
       tags: ['providers'],
       operationId: 'createProvider',
     },
@@ -261,7 +257,17 @@ export function registerModelCatalogRoutes(app: ModelCatalogRouteHost, core: Sco
         }
 
         const provider: ProviderConfig = { type: req.body.type };
-        if (req.body.api_key !== undefined) provider.apiKey = req.body.api_key;
+        const credential = reconcileProviderCredentialUpdate(
+          {},
+          { apiKey: req.body.api_key, apiKeyEnv: req.body.api_key_env },
+          id,
+        );
+        if (!credential.ok) {
+          reply.send(errEnvelope(ErrorCode.VALIDATION_FAILED, credential.message, req.id));
+          return;
+        }
+        if (credential.apiKey !== undefined) provider.apiKey = credential.apiKey;
+        if (credential.apiKeyEnv !== undefined) provider.apiKeyEnv = credential.apiKeyEnv;
         if (req.body.base_url !== undefined) provider.baseUrl = req.body.base_url;
         if (req.body.default_model !== undefined) {
           provider.defaultModel = `${id}/${req.body.default_model}`;
@@ -319,7 +325,7 @@ export function registerModelCatalogRoutes(app: ModelCatalogRouteHost, core: Sco
         [ErrorCode.PROVIDER_ALREADY_EXISTS]: {},
       },
       description:
-        'Replace a provider in one save (type + base_url + model list), optionally renaming it via `new_id` (the providers key, model aliases, default_provider and a default_model pointing at an old alias all migrate). `api_key` is tri-state: omitted keeps the stored key, "" clears it, any other value replaces it. The provider\'s model aliases are rebuilt from `models` — aliases no longer listed disappear from config.toml, other providers\' aliases are untouched. Beyond the rename migration, the global default pointers are never modified. Answers 200 with `{provider}`. OAuth-managed providers are rejected: log out via /oauth/logout instead.',
+        'Replace a provider in one save (type + base_url + model list), optionally renaming it via `new_id` (the providers key, model aliases, default_provider and a default_model pointing at an old alias all migrate). `api_key` is tri-state: omitted keeps the stored key, "" clears it, any other value replaces it. `api_key_env` (name of an environment variable to read the key from instead of storing it) is likewise tri-state and mutually exclusive with `api_key` — setting one clears the other, submitting both fails validation. The provider\'s model aliases are rebuilt from `models` — aliases no longer listed disappear from config.toml, other providers\' aliases are untouched. Beyond the rename migration, the global default pointers are never modified. Answers 200 with `{provider}`. OAuth-managed providers are rejected: log out via /oauth/logout instead.',
       tags: ['providers'],
       operationId: 'replaceProvider',
     },
@@ -363,7 +369,17 @@ export function registerModelCatalogRoutes(app: ModelCatalogRouteHost, core: Sco
         }
 
         const provider: ProviderConfig = { ...target, type: req.body.type };
-        provider.apiKey = req.body.api_key ?? target.apiKey;
+        const credential = reconcileProviderCredentialUpdate(
+          target,
+          { apiKey: req.body.api_key, apiKeyEnv: req.body.api_key_env },
+          provider_id,
+        );
+        if (!credential.ok) {
+          reply.send(errEnvelope(ErrorCode.VALIDATION_FAILED, credential.message, req.id));
+          return;
+        }
+        provider.apiKey = credential.apiKey;
+        provider.apiKeyEnv = credential.apiKeyEnv;
         provider.baseUrl = req.body.base_url;
         provider.defaultModel =
           req.body.default_model !== undefined
@@ -442,24 +458,6 @@ export function registerModelCatalogRoutes(app: ModelCatalogRouteHost, core: Sco
               await config.replace(DEFAULT_MODEL_SECTION, renamedAlias);
             }
           }
-        }
-
-        const renamedAliases = new Map<string, string>();
-        if (newId !== provider_id) {
-          for (const oldAlias of previousAliasIds) {
-            const bare = models[oldAlias]?.model;
-            const renamed = bare === undefined ? undefined : `${newId}/${bare}`;
-            if (renamed !== undefined && nextModels[renamed] !== undefined) {
-              renamedAliases.set(oldAlias, renamed);
-            }
-          }
-        }
-        const secondaryModel = config.inspect<SecondaryModelConfig>(
-          SECONDARY_MODEL_SECTION,
-        ).userValue;
-        const cascadedPool = cascadeSubagentModelPool(secondaryModel, nextModels, renamedAliases);
-        if (cascadedPool !== undefined) {
-          await config.replace(SECONDARY_MODEL_SECTION, cascadedPool);
         }
 
         const saved = await core.accessor.get(IModelCatalog).getProvider(newId);
@@ -551,9 +549,9 @@ export function registerModelCatalogRoutes(app: ModelCatalogRouteHost, core: Sco
           providerId: parsed.id,
         });
         reply.send(okEnvelope(result, req.id));
-      } catch (err) {
-        if (sendMappedError(reply, req.id, err)) return;
-        throw err;
+      } catch (error) {
+        if (sendMappedError(reply, req.id, error)) return;
+        throw error;
       }
     },
   );
@@ -590,9 +588,9 @@ export function registerModelCatalogRoutes(app: ModelCatalogRouteHost, core: Sco
             req.id,
           ),
         );
-      } catch (err) {
-        if (sendMappedError(reply, req.id, err)) return;
-        throw err;
+      } catch (error) {
+        if (sendMappedError(reply, req.id, error)) return;
+        throw error;
       }
     },
   );
@@ -657,13 +655,6 @@ export function registerModelCatalogRoutes(app: ModelCatalogRouteHost, core: Sco
         if (Object.keys(restModels).length !== Object.keys(models).length) {
           await config.replace(MODELS_SECTION, restModels);
         }
-        const secondaryModel = config.inspect<SecondaryModelConfig>(
-          SECONDARY_MODEL_SECTION,
-        ).userValue;
-        const cascadedPool = cascadeSubagentModelPool(secondaryModel, restModels);
-        if (cascadedPool !== undefined) {
-          await config.replace(SECONDARY_MODEL_SECTION, cascadedPool);
-        }
         (reply as unknown as StatusReply).code(204).send();
       });
     },
@@ -689,9 +680,9 @@ export function registerModelCatalogRoutes(app: ModelCatalogRouteHost, core: Sco
       try {
         const items = await core.accessor.get(IModelsDevImportService).listModelsDevProviders();
         reply.send(okEnvelope({ items }, req.id));
-      } catch (err) {
-        if (sendModelsDevImportError(reply, req.id, err)) return;
-        throw err;
+      } catch (error) {
+        if (sendModelsDevImportError(reply, req.id, error)) return;
+        throw error;
       }
     },
   );
@@ -720,9 +711,9 @@ export function registerModelCatalogRoutes(app: ModelCatalogRouteHost, core: Sco
         const { catalog_id } = req.params;
         const item = await core.accessor.get(IModelsDevImportService).getModelsDevProvider(catalog_id);
         reply.send(okEnvelope(item, req.id));
-      } catch (err) {
-        if (sendModelsDevImportError(reply, req.id, err)) return;
-        throw err;
+      } catch (error) {
+        if (sendModelsDevImportError(reply, req.id, error)) return;
+        throw error;
       }
     },
   );
@@ -802,9 +793,9 @@ async function handleImportCatalog(
           req.id,
         ),
       );
-  } catch (err) {
-    if (sendModelsDevImportError(reply, req.id, err)) return;
-    throw err;
+  } catch (error) {
+    if (sendModelsDevImportError(reply, req.id, error)) return;
+    throw error;
   }
 }
 
@@ -829,13 +820,17 @@ async function handleImportRegistry(
       .code(201)
       .send(
         okEnvelope(
-          { providers: result.providers, models_imported: result.modelsImported },
+          {
+            providers: result.providers,
+            models_imported: result.modelsImported,
+            credential_env: result.credentialEnv,
+          },
           req.id,
         ),
       );
-  } catch (err) {
-    if (sendModelsDevImportError(reply, req.id, err)) return;
-    throw err;
+  } catch (error) {
+    if (sendModelsDevImportError(reply, req.id, error)) return;
+    throw error;
   }
 }
 

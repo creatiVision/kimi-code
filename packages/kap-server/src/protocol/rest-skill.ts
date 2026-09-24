@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-import { fileContentSchema, imageContentSchema, videoContentSchema } from './message';
+import { fileContentSchema, imageContentSchema, textContentSchema, videoContentSchema } from './message';
 import { skillDescriptorSchema } from './skill';
 
 export const listSkillsResponseSchema = z.object({
@@ -8,11 +8,8 @@ export const listSkillsResponseSchema = z.object({
 });
 export type ListSkillsResponse = z.infer<typeof listSkillsResponseSchema>;
 
-/**
- * Attachment parts accepted on skill activation — the media/file subset of
- * the prompt submission's `MessageContent` (text stays in `args`).
- */
 export const activateSkillAttachmentSchema = z.discriminatedUnion('type', [
+  textContentSchema,
   imageContentSchema,
   videoContentSchema,
   fileContentSchema,
@@ -21,6 +18,7 @@ export type ActivateSkillAttachment = z.infer<typeof activateSkillAttachmentSche
 
 export const activateSkillRequestSchema = z.object({
   args: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
   attachments: z.array(activateSkillAttachmentSchema).optional(),
 });
 export type ActivateSkillRequest = z.infer<typeof activateSkillRequestSchema>;

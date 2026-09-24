@@ -1,5 +1,5 @@
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 
 import { TuiAltScreen, TuiMainScreen } from '@moonshot-ai/pi-tui';
 
@@ -58,10 +58,13 @@ describe('createTUIState', () => {
     expect(state.activityContainer).toBeDefined();
     expect(state.todoPanelContainer).toBeDefined();
     expect(state.queueContainer).toBeDefined();
+    expect(state.surveyContainer).toBeDefined();
     expect(state.editorContainer).toBeDefined();
     expect(state.editor).toBeDefined();
     expect(state.footer).toBeDefined();
     expect(state.todoPanel).toBeDefined();
+    expect(state.notifyPanelContainer).toBeDefined();
+    expect(state.notifyPanel).toBeDefined();
     expect(state.theme.palette).toBeDefined();
 
     // App state is cloned from initialAppState, not reused by reference.
@@ -106,9 +109,8 @@ describe('createTUIState', () => {
   });
 
   it('builds an alternate-screen renderer with a docked layout in fullscreen mode', () => {
-    vi.stubEnv('KIMI_CODE_TUI_FULL_SCREEN', '1');
     const state = createTUIState({
-      initialAppState: fakeInitialAppState(),
+      initialAppState: { ...fakeInitialAppState(), tuiMode: 'fullscreen' },
       startup: {
         continueLast: false,
         yolo: false,
@@ -116,7 +118,6 @@ describe('createTUIState', () => {
         plan: false,
       },
     });
-    vi.unstubAllEnvs();
 
     expect(state.ui).toBeInstanceOf(TuiAltScreen);
     expect(state.ui.mode).toBe('fullscreen');
@@ -127,8 +128,10 @@ describe('createTUIState', () => {
     expect(dock?.children).toEqual([
       state.activityContainer,
       state.todoPanelContainer,
+      state.notifyPanelContainer,
       state.queueContainer,
       state.btwPanelContainer,
+      state.surveyContainer,
       state.editorContainer,
     ]);
 

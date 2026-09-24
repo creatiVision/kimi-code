@@ -65,6 +65,14 @@ export class SubagentRosterTracker {
         entry.output_preview = event.error;
         return;
       }
+      case 'subagent.cancelled': {
+        const entry = this.bySession.get(sessionId)?.get(event.subagentId);
+        if (!entry) return;
+        entry.subagent_phase = 'cancelled';
+        entry.status = 'cancelled';
+        entry.completed_at = new Date().toISOString();
+        return;
+      }
       case 'task.started': {
         const info = event.info;
         if (info.kind === 'agent' && info.detached === true && info.agentId !== undefined) {
@@ -96,7 +104,6 @@ export class SubagentRosterTracker {
     }
   }
 
-  /** Fresh copies — callers must not mutate the tracked entries. */
   get(sessionId: string): SnapshotSubagent[] {
     const roster = this.bySession.get(sessionId);
     if (!roster) return [];

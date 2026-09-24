@@ -13,28 +13,18 @@ export type EnvBinding =
   | string
   | {
       readonly env: string;
-      /**
-       * Deprecated former name of `env`. Still honored (with a deprecation
-       * warning) when `env` itself is absent or fails to parse, so existing
-       * setups keep working until the user renames the variable.
-       */
       readonly deprecatedEnv?: string;
       readonly parse?: (raw: string) => unknown;
       readonly default?: unknown;
     };
 
-/**
- * A declared config-key rename: `key` (snake_case, as written on disk) is
- * deprecated in favor of `replacement`. While the old key is present in the
- * user's config file the service reports a warning diagnostic; the old value
- * is NOT honored — only `replacement` (or the section default) applies.
- */
 export interface ConfigKeyDeprecation {
   readonly key: string;
   readonly replacement: string;
-  /** Optional extra guidance appended to the generated warning message. */
   readonly message?: string;
 }
+
+export type ConfigCollectDiagnostics = (rawSection: unknown) => readonly ConfigDiagnostic[];
 
 export type EnvBindings<T> = EnvBinding | { [K in keyof T]?: EnvBinding | EnvBindings<T[K]> };
 
@@ -105,6 +95,7 @@ export interface ConfigSection<T = unknown> {
   readonly fromToml?: ConfigFromToml;
   readonly toToml?: ConfigToToml;
   readonly deprecations?: readonly ConfigKeyDeprecation[];
+  readonly collectDiagnostics?: ConfigCollectDiagnostics;
 }
 
 export interface RegisterSectionOptions<T> {
@@ -116,6 +107,7 @@ export interface RegisterSectionOptions<T> {
   readonly fromToml?: ConfigFromToml;
   readonly toToml?: ConfigToToml;
   readonly deprecations?: readonly ConfigKeyDeprecation[];
+  readonly collectDiagnostics?: ConfigCollectDiagnostics;
 }
 
 export interface ConfigEffectiveOverlay {
@@ -201,17 +193,18 @@ export interface ConfigInspectValue<T = unknown> {
   readonly memoryValue: T | undefined;
 }
 
+export interface ConfigReplaceSectionsOptions {
+  readonly preserveUnknown?: boolean;
+  readonly exactKeys?: Readonly<Record<string, readonly string[]>>;
+  readonly expectedValues?: Readonly<Record<string, unknown>>;
+}
+
 export interface IConfigService {
   readonly _serviceBrand: undefined;
 
   readonly ready: Promise<void>;
   readonly onDidChangeConfiguration: Event<ConfigChangedEvent>;
   readonly onDidSectionChange: Event<ConfigSectionChangedEvent>;
-  /**
-   * Fired when the diagnostics list changes (load / reload / env overlay
-   * re-application), carrying the full current list — including an empty
-   * list when the last diagnostic clears.
-   */
   readonly onDidChangeDiagnostics: Event<readonly ConfigDiagnostic[]>;
   get<T = unknown>(domain: string): T;
   inspect<T = unknown>(domain: string): ConfigInspectValue<T>;
@@ -221,6 +214,7 @@ export interface IConfigService {
   replaceSections(
     sections: Readonly<Record<string, unknown>>,
     target?: ConfigTarget,
+    options?: ConfigReplaceSectionsOptions,
   ): Promise<void>;
   reload(): Promise<void>;
   diagnostics(): readonly ConfigDiagnostic[];

@@ -1,6 +1,8 @@
+import type { UserPromptOrigin } from '#/agent/contextMemory/types';
 /* oxlint-disable typescript-eslint/no-unsafe-declaration-merging, eslint-plugin-import/namespace -- Event2 class+payload-interface declaration merging is the sanctioned event-declaration idiom. */
 import { type IDisposable } from '#/_base/di/lifecycle';
 import { Service } from '#/_base/di/service';
+import { BugIndicatingError } from '#/_base/errors/errors';
 import { LifecycleScope } from '#/app/scopes';
 import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { ILogService } from '#/_base/log/log';
@@ -17,7 +19,7 @@ import {
 } from '#/agent/contextMemory/conversationTime';
 import { IAgentFullCompactionService } from '#/agent/fullCompaction/fullCompaction';
 import { IAgentLoopService } from '#/agent/loop/loop';
-import { IAgentPromptService } from '#/agent/prompt/prompt';
+import { turnKey } from '#/agent/loop/turnOps';
 import { promptMetadataTextFromContentParts } from '#/agent/prompt/promptMetadataText';
 import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
 import { IAgentStateService } from '#/agent/state/agentState';
@@ -29,18 +31,24 @@ import { MAIN_AGENT_ID } from '#/session/agentLifecycle/agentLifecycle';
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
 import { ISessionMetadata } from '#/session/sessionMetadata/sessionMetadata';
 import { SessionMetaUpdated } from '#/session/sessionMetadata/sessionMetaEvents';
+import { ISessionTokenCountingService } from '#/session/tokenCounting/sessionTokenCounting';
 import { IEventDispatcher } from '#/state/eventDispatcher';
-import { keepsUndoCheckpoints } from '#/state/state';
+import { ForkLineError, IWireService } from '#/wire/wire';
 
 import { IAgentConversationUndoService, type UndoAvailability } from './undo';
 
-export class ContextUndone extends AgentEvent2<{ readonly agentId: string; readonly turns: number }> {
+export class ContextUndone extends AgentEvent2<{
+  readonly agentId: string;
+  readonly turns: number;
+  readonly fromTurnId?: number;
+}> {
   static override readonly type = 'context.undone';
   static override readonly observable = true;
 }
 export interface ContextUndone {
   readonly agentId: string;
   readonly turns: number;
+  readonly fromTurnId?: number;
 }
 
 export class AgentConversationUndoService
@@ -54,7 +62,6 @@ export class AgentConversationUndoService
   constructor(
     @IAgentLoopService private readonly loop: IAgentLoopService,
     @IAgentFullCompactionService private readonly fullCompaction: IAgentFullCompactionService,
-    @IAgentPromptService private readonly prompt: IAgentPromptService,
     @IAgentContextMemoryService private readonly context: IAgentContextMemoryService,
     @IAgentConversationUndoParticipantRegistry
     private readonly participants: IAgentConversationUndoParticipantRegistry,
@@ -65,6 +72,8 @@ export class AgentConversationUndoService
     @ITelemetryService private readonly telemetry: ITelemetryService,
     @IEventDispatcher private readonly dispatcher: IEventDispatcher,
     @IAgentStateService private readonly agentState: IAgentStateService,
+    @ISessionTokenCountingService private readonly tokenCounting: ISessionTokenCountingService,
+    @IWireService private readonly wire: IWireService,
     @ILogService private readonly log: ILogService,
   ) {
     super();
@@ -72,10 +81,9 @@ export class AgentConversationUndoService
 
   availability(): UndoAvailability {
     const cut = computeUndoCut(this.context.get(), Number.MAX_SAFE_INTEGER);
-    const maxTurns = Math.min(cut.removedCount, this.checkpointDepth().depth);
     return {
-      maxTurns,
-      stoppedAtCompaction: cut.stoppedAtCompaction || maxTurns < cut.removedCount,
+      maxTurns: cut.removedCount,
+      stoppedAtCompaction: cut.stoppedAtCompaction,
     };
   }
 
@@ -105,15 +113,36 @@ export class AgentConversationUndoService
       if (this.fullCompaction.compacting !== null) {
         throw this.busyError('compaction');
       }
+      if (this.dispatcher.restorePhase !== 'ready') {
+        throw new BugIndicatingError(
+          `Conversation undo requires a restored dispatcher (phase '${this.dispatcher.restorePhase}')`,
+        );
+      }
       this.assertUndoAvailable(turns);
-      this.context.undo(turns);
-      await this.flushAfterCommit('context cut');
+      const fromTurnId = this.removedFromTurnId(turns);
+      try {
+        await this.wire.switchBranch({ turns, fromTurnId });
+      } catch (error) {
+        throw this.forkError(error, turns);
+      }
+      try {
+        await this.dispatcher.restore();
+      } catch (error) {
+        this.log.warn('undo state restore failed; retrying once', { error });
+        await this.dispatcher.restore();
+      }
+      await this.loop.resetMachineEngine();
+      this.tokenCounting.recordTruncation(
+        this.agentCtx.agentContext,
+        this.context.get().length,
+      );
       await this.reconcileParticipants();
-      await this.flushAfterCommit('state reconciliation');
+      await this.flushAfterReconcile();
+      await this.reconcileParticipants('after-flush');
       await this.reconcileLastPromptSafely();
       this.telemetry.track2('conversation_undo', { count: turns });
       await this.dispatcher.dispatch(
-        new ContextUndone({ agentId: this.agentCtx.agentId, turns }),
+        new ContextUndone({ agentId: this.agentCtx.agentId, turns, fromTurnId }),
       );
       return turns;
     } finally {
@@ -121,24 +150,33 @@ export class AgentConversationUndoService
     }
   }
 
-  private checkpointDepth(): { depth: number; model: string } {
-    let depth = Number.POSITIVE_INFINITY;
-    let model = '';
-    for (const key of this.agentState.replayableKeys()) {
-      if (!keepsUndoCheckpoints(key)) continue;
-      const stateDepth = this.dispatcher.checkpointDepth(key);
-      if (stateDepth < depth) {
-        depth = stateDepth;
-        model = key.name;
-      }
-    }
-    for (const entry of this.dispatcher.modelCheckpointDepths()) {
-      if (entry.depth < depth) {
-        depth = entry.depth;
-        model = entry.id;
-      }
-    }
-    return { depth, model };
+  private forkError(error: unknown, turns: number): unknown {
+    if (!(error instanceof ForkLineError)) return error;
+    return new Error2(
+      ErrorCodes.SESSION_UNDO_UNAVAILABLE,
+      formatUndoUnavailableMessage({
+        ok: false,
+        reason: error.reason,
+        requested: turns,
+        undoable: error.available,
+      }),
+      {
+        details: {
+          reason: error.reason,
+          requestedCount: turns,
+          undoableCount: error.available,
+        },
+      },
+    );
+  }
+
+  private removedFromTurnId(turns: number): number | undefined {
+    if (!this.agentState.has(turnKey)) return undefined;
+    const anchorTurnIds = this.agentState.get(turnKey).anchorTurnIds;
+    if (anchorTurnIds.length < turns) return undefined;
+    const totalAnchors = computeUndoCut(this.context.get(), Number.MAX_SAFE_INTEGER).removedCount;
+    if (totalAnchors !== anchorTurnIds.length) return undefined;
+    return anchorTurnIds[anchorTurnIds.length - turns];
   }
 
   private busyError(reason: 'loop' | 'compaction'): Error2 {
@@ -150,44 +188,22 @@ export class AgentConversationUndoService
 
   private assertUndoAvailable(turns: number): void {
     const check = precheckUndo(this.context.get(), turns);
-    if (!check.ok) {
-      throw new Error2(
-        ErrorCodes.SESSION_UNDO_UNAVAILABLE,
-        formatUndoUnavailableMessage(check),
-        {
-          details: {
-            reason: check.reason,
-            requestedCount: check.requested,
-            undoableCount: check.undoable,
-          },
-        },
-      );
-    }
-    const { depth, model } = this.checkpointDepth();
-    if (depth >= turns) return;
-    const fullCut = computeUndoCut(this.context.get(), Number.MAX_SAFE_INTEGER);
-    const reason = fullCut.stoppedAtCompaction ? 'compaction_boundary' : 'checkpoint_lost';
+    if (check.ok) return;
     throw new Error2(
       ErrorCodes.SESSION_UNDO_UNAVAILABLE,
-      formatUndoUnavailableMessage({
-        ok: false,
-        reason,
-        requested: turns,
-        undoable: depth,
-      }),
+      formatUndoUnavailableMessage(check),
       {
         details: {
-          reason,
-          requestedCount: turns,
-          undoableCount: depth,
-          model,
+          reason: check.reason,
+          requestedCount: check.requested,
+          undoableCount: check.undoable,
         },
       },
     );
   }
 
-  private async reconcileParticipants(): Promise<void> {
-    const participants = this.participants.list();
+  private async reconcileParticipants(phase?: 'after-flush'): Promise<void> {
+    const participants = this.participants.list().filter((participant) => participant.phase === phase);
     const results = await Promise.allSettled(
       participants.map((participant) => participant.reconcileAfterUndo()),
     );
@@ -208,27 +224,30 @@ export class AgentConversationUndoService
     }
   }
 
-  private async flushAfterCommit(stage: string): Promise<void> {
+  private async flushAfterReconcile(): Promise<void> {
     try {
       await this.dispatcher.flush();
     } catch (error) {
-      this.log.error('undo wire flush failed after in-memory commit', { stage, error });
+      this.log.error('undo wire flush failed after in-memory commit', {
+        stage: 'state reconciliation',
+        error,
+      });
       throw error;
     }
   }
 
   private async reconcileLastPrompt(): Promise<void> {
     if (this.agentCtx.agentId !== MAIN_AGENT_ID) return;
-    const pending = this.prompt.list().pending.at(-1);
+    const pending = this.loop.snapshot().queue.filter((item) => item.meta?.tracked === true).at(-1);
     let lastPrompt = pending === undefined
       ? undefined
-      : promptMetadataTextFromContentParts(pending.message.content);
+      : promptMetadataTextFromContentParts(pending.message.content, (pending.meta?.origin as UserPromptOrigin | undefined)?.clientMetadata);
     if (lastPrompt === undefined) {
       const history = this.context.get();
       for (let i = history.length - 1; i >= 0; i--) {
         const message = history[i]!;
         if (!isUndoAnchor(message)) continue;
-        lastPrompt = promptMetadataTextFromContentParts(message.content);
+        lastPrompt = promptMetadataTextFromContentParts(message.content, message.origin?.kind === 'user' || message.origin?.kind === 'skill_activation' ? message.origin.clientMetadata : undefined);
         if (lastPrompt !== undefined) break;
       }
     }

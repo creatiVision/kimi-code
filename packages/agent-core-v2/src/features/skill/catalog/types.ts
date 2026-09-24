@@ -1,5 +1,7 @@
 export type SkillSource = 'project' | 'user' | 'extra' | 'builtin';
 
+export type SkillScope = 'tui' | 'web';
+
 export interface SkillMetadata {
   readonly name?: string;
   readonly description?: string;
@@ -30,6 +32,7 @@ export interface SkillDefinition {
   readonly mermaid?: string;
   readonly d2?: string;
   readonly productSpecific?: boolean;
+  readonly scopes?: readonly SkillScope[];
   readonly experimentalFlag?: string;
 }
 
@@ -41,6 +44,7 @@ export interface SkillSummary {
   readonly type?: string;
   readonly disableModelInvocation?: boolean;
   readonly isSubSkill?: boolean;
+  readonly scopes?: readonly SkillScope[];
   readonly category?: string;
   readonly categories?: readonly string[];
   readonly issuer?: string;
@@ -107,6 +111,7 @@ export function summarizeSkill(skill: SkillDefinition): SkillSummary {
     type: skill.metadata.type,
     disableModelInvocation: skill.metadata.disableModelInvocation,
     isSubSkill: skill.metadata.isSubSkill,
+    scopes: skill.scopes,
     category: typeof skill.metadata.category === 'string' && skill.metadata.category.trim() !== '' ? skill.metadata.category.trim() : undefined,
     categories: Array.isArray(skill.metadata.categories)
       ? skill.metadata.categories.filter((c): c is string => typeof c === 'string' && c.trim() !== '')

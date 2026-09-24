@@ -8,7 +8,6 @@ export const LOOP_CONTROL_SECTION = 'loopControl';
 
 export const LOOP_MAX_STEPS_PER_TURN_ENV = 'KIMI_LOOP_MAX_STEPS_PER_TURN';
 export const LOOP_MAX_ATTEMPTS_PER_STEP_ENV = 'KIMI_LOOP_MAX_ATTEMPTS_PER_STEP';
-/** Deprecated former name of {@link LOOP_MAX_ATTEMPTS_PER_STEP_ENV}. */
 export const LOOP_MAX_RETRIES_PER_STEP_ENV = 'KIMI_LOOP_MAX_RETRIES_PER_STEP';
 
 export const LoopControlSchema = z.object({
@@ -17,6 +16,7 @@ export const LoopControlSchema = z.object({
   maxRalphIterations: z.number().int().min(-1).optional(),
   reservedContextSize: z.number().int().min(0).optional(),
   compactionTriggerRatio: z.number().min(0.5).max(0.99).optional(),
+  compactionMaxAttempts: z.number().int().min(1).optional(),
 });
 
 export type LoopControl = z.infer<typeof LoopControlSchema>;

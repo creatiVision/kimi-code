@@ -6,10 +6,11 @@ import type {
   ProviderConfig,
   PromptPart,
   ThinkingEffort,
+  TokenUsage,
   ToolInputDisplay,
 } from '@moonshot-ai/kimi-code-sdk';
 
-import type { NotificationsConfig, StatusLineConfig, UpgradePreferences } from './config';
+import type { MarkdownConfig, NotificationsConfig, StatusLineConfig, TuiMode, UpgradePreferences } from './config';
 import type { PendingApproval, PendingQuestion } from './reverse-rpc/types';
 import type { ColorToken, ThemeName } from './theme';
 
@@ -18,7 +19,7 @@ export type BannerDisplay = 'always' | 'once' | 'cooldown';
 export interface BannerState {
   key: string;
   tag: string | null;
-  mainText: string;
+  mainText: string | null;
   subText: string | null;
   display: BannerDisplay;
   ttlHours?: number;
@@ -63,6 +64,7 @@ export interface AppState {
   contextUsage: number;
   contextTokens: number;
   maxContextTokens: number;
+  cumulativeTokens?: number;
   isCompacting: boolean;
   isReplaying: boolean;
   streamingPhase: 'idle' | 'waiting' | 'thinking' | 'composing' | 'shell';
@@ -70,6 +72,7 @@ export interface AppState {
   /** Pending step retry backoff (fed by `turn.step.retrying`); null when no retry is in flight. */
   stepRetry: StepRetryState | null;
   theme: ThemeName;
+  tuiMode?: TuiMode;
   version: string;
   editorCommand: string | null;
   /** Mirrors the TUI config toggle; defaults to false when absent from older fixtures. */
@@ -78,10 +81,12 @@ export interface AppState {
   renderLatex?: boolean;
   /** Mirrors the TUI config toggle; defaults to true when absent from older fixtures. */
   cacheExpiryHint?: boolean;
+  disableFeedbackSurvey?: boolean;
   notifications: NotificationsConfig;
   upgrade: UpgradePreferences;
   /** Footer status line customization from tui.toml; absent means the default layout. */
   statusLine?: StatusLineConfig;
+  markdown?: MarkdownConfig;
   availableModels: Record<string, ModelAlias>;
   availableProviders: Record<string, ProviderConfig>;
   sessionTitle: string | null;
@@ -90,6 +95,10 @@ export interface AppState {
   mcpServersSummary: string | null;
   /** Optional banner shown below the welcome panel; null means no banner to render. */
   banner?: BannerState | null;
+}
+
+export function sumTokenUsage(total: TokenUsage): number {
+  return total.inputOther + total.output + total.inputCacheRead + total.inputCacheCreation;
 }
 
 export interface StepRetryState {
@@ -161,7 +170,7 @@ export interface BackgroundAgentMetadata {
   readonly effort?: string;
 }
 
-export type BackgroundAgentStatusPhase = 'started' | 'completed' | 'failed';
+export type BackgroundAgentStatusPhase = 'started' | 'completed' | 'failed' | 'killed';
 
 export interface BackgroundAgentStatusData {
   readonly phase: BackgroundAgentStatusPhase;

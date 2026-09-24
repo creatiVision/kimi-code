@@ -3,7 +3,6 @@ import { ErrorCodes, Error2 } from '@moonshot-ai/agent-core-v2';
 import { errEnvelope } from '../protocol/envelope';
 import { ErrorCode } from '../protocol/error-codes';
 
-/** Thrown by {@link withTimeout} when a call exceeds its deadline. */
 export class TimeoutError extends Error {
   constructor(readonly ms: number) {
     super(`call timed out after ${ms}ms`);
@@ -11,7 +10,6 @@ export class TimeoutError extends Error {
   }
 }
 
-/** Race a promise against a deadline. */
 export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   if (ms <= 0) return promise;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -34,7 +32,6 @@ const KIMI_TO_PROTOCOL: Record<string, ErrorCode> = {
   [ErrorCodes.PROMPT_NOT_FOUND]: ErrorCode.PROMPT_NOT_FOUND,
   [ErrorCodes.FS_PATH_NOT_FOUND]: ErrorCode.FS_PATH_NOT_FOUND,
   [ErrorCodes.SESSION_BUSY]: ErrorCode.SESSION_BUSY,
-  [ErrorCodes.PROMPT_ALREADY_COMPLETED]: ErrorCode.PROMPT_ALREADY_COMPLETED,
   [ErrorCodes.PROMPT_ID_CONFLICT]: ErrorCode.PROMPT_ID_CONFLICT,
   [ErrorCodes.GOAL_ALREADY_EXISTS]: ErrorCode.GOAL_ALREADY_EXISTS,
   [ErrorCodes.GOAL_NOT_FOUND]: ErrorCode.GOAL_NOT_FOUND,
@@ -52,11 +49,6 @@ const KIMI_TO_PROTOCOL: Record<string, ErrorCode> = {
   [ErrorCodes.STORAGE_LOCKED]: ErrorCode.PERSISTENCE_FAILURE,
 };
 
-/**
- * Map an internal error to the project envelope. `Error2` keeps its coded
- * mapping; everything else becomes `50001`. Stack traces are intentionally not
- * surfaced.
- */
 export function mapError(err: unknown, requestId: string): ReturnType<typeof errEnvelope> {
   if (err instanceof Error2) {
     const code = KIMI_TO_PROTOCOL[err.code] ?? ErrorCode.INTERNAL_ERROR;
@@ -73,7 +65,6 @@ export function mapError(err: unknown, requestId: string): ReturnType<typeof err
   );
 }
 
-/** Build a `40001` envelope with structured details. */
 export function validationEnvelope(
   details: { path: string; message: string }[],
   requestId: string,
@@ -100,11 +91,6 @@ export function validationEnvelope(
   };
 }
 
-/**
- * Ensure a value survives a JSON round-trip (catches circular refs, `BigInt`,
- * functions). Returns the value unchanged; throws `Error2` on failure so the
- * caller maps it to `50001` with a clear message.
- */
 export function assertSerializable(value: unknown): unknown {
   if (value === undefined) return null;
   try {
