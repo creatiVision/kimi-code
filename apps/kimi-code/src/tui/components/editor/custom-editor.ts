@@ -658,7 +658,10 @@ export class CustomEditor extends Editor {
       textBeforeCursor.startsWith('/') &&
       textBeforeCursor.includes(' ')
     ) {
-      trigger();
+      const cmdName = textBeforeCursor.trim().slice(1);
+      if (cmdName !== 'skill' && cmdName !== 'skills') {
+        trigger();
+      }
     }
   }
 }
