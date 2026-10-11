@@ -28,6 +28,8 @@ import {
   type Component,
   type Focusable,
   getCapabilities,
+  Key,
+  matchesKey,
   Spacer,
   TuiAltScreen,
   TuiMainScreen,
@@ -119,6 +121,7 @@ import {
   PRODUCT_NAME,
   SESSION_LIST_PAGE_SIZE,
   SESSIONLESS_STARTUP_NOTICE,
+  SHUTTING_DOWN_HINT,
 } from './constant/kimi-tui';
 import { MEDIA_INGESTION_SUBMIT_WAIT_MS } from './constant/media';
 import { CHROME_GUTTER } from './constant/rendering';
@@ -345,6 +348,7 @@ export class KimiTUI {
   private readonly cacheHint = new CacheHintController(this);
   /** Staged prompt media lifecycle (daemon uploads + cache copies) — see StagingLeaseTracker. */
   private readonly staging: StagingLeaseTracker;
+  private readonly steeringQueuedMessages = new Set<QueuedMessage>();
   private readonly approvalController = new ApprovalController();
   private readonly questionController = new QuestionController();
   private readonly reverseRpcDisposers: Array<() => void> = [];
@@ -996,7 +1000,10 @@ export class KimiTUI {
     }
 
     if (session !== undefined) {
-      await this.setSession(session);
+      await this.setSession(
+        session,
+        shouldReplayHistory ? session.getResumeState()?.agents[MAIN_AGENT_ID]?.userTurnCount : 0,
+      );
       await this.syncRuntimeState(session);
     }
     this.applyStartupPermissionAndPlanToAppState();
@@ -1009,6 +1016,15 @@ export class KimiTUI {
     this.isShuttingDown = true;
     this.unregisterSignalHandlers();
     this.aborted = true;
+    // A Ctrl+C during shutdown means "don't wait for slow hooks": skip the
+    // remaining graceful close and get out immediately. Captured at the UI
+    // input-listener level so it works no matter which component holds focus
+    // (a dialog may have replaced the editor).
+    const removeForceExitListener = this.state.ui.addInputListener((data) => {
+      if (!matchesKey(data, Key.ctrl('c'))) return undefined;
+      this.forceExitDuringShutdown();
+      return { consume: true };
+    });
     // Give the startup provider-model refresh a brief chance to finish before
     // the harness closes (and the process exits): its config writes are each
     // atomic, so draining can only ever leave a complete file behind. Bounded
@@ -1037,6 +1053,11 @@ export class KimiTUI {
     }
     this.reverseRpcDisposers.length = 0;
     this.disposeTerminalTracking();
+    // closeSession runs SessionEnd hooks, which can take seconds (bounded by
+    // the hook timeout) — keep the last frame from looking like a freeze by
+    // saying the shutdown is in progress.
+    this.state.footer.setTransientHint(SHUTTING_DOWN_HINT);
+    this.state.ui.requestRender();
     // Restore the terminal even if closing the session / harness throws — a
     // SIGTERM during a network or MCP shutdown must not leave the user stuck in
     // raw mode with a hidden cursor.
@@ -1048,6 +1069,7 @@ export class KimiTUI {
       await this.staging.drain();
       await this.harness.close();
     } finally {
+      removeForceExitListener();
       this.sessionEventHandler.stopAllMcpServerStatusSpinners();
       this.sessionEventHandler.clearStepRetryAttemptTimer();
       this.uninstallRainbowDance();
@@ -1064,6 +1086,23 @@ export class KimiTUI {
     }
     if (this.onExit) {
       await this.onExit(exitCode);
+    }
+  }
+
+  // Ctrl+C while shutdown hooks run → skip the remaining graceful close. The
+  // terminal is still alive (unlike the SIGHUP path), so run the full UI
+  // teardown — alternate screen, mouse reporting, autowrap — and the CLI's
+  // stty restore via onExit, instead of the bare emergency sequences.
+  private forceExitDuringShutdown(): void {
+    try {
+      this.stopUiForExit();
+    } catch {
+      restoreTerminalModes();
+    }
+    if (this.onExit) {
+      void this.onExit(130);
+    } else {
+      process.exit(130);
     }
   }
 
@@ -1634,6 +1673,7 @@ export class KimiTUI {
   recallLastQueued(): QueuedMessage | undefined {
     if (this.state.queuedMessages.length === 0) return undefined;
     const last = this.state.queuedMessages.at(-1)!;
+    if (this.steeringQueuedMessages.has(last)) return undefined;
     this.state.queuedMessages = this.state.queuedMessages.slice(0, -1);
     // A recall restores the draft into the editor — it is not a discard:
     // consumes the retains only, keeping the staged daemon uploads alive
@@ -1670,7 +1710,18 @@ export class KimiTUI {
     },
     mode?: 'prompt' | 'bash',
   ): void {
-    this.state.queuedMessages.push({
+    this.state.queuedMessages.push(this.toQueuedMessage(text, options, mode));
+    this.track('input_queue');
+  }
+
+  private toQueuedMessage(
+    text: string,
+    options?: SendMessageOptions & {
+      readonly inlineSkillActivations?: readonly InlineSkillActivation[];
+    },
+    mode?: 'prompt' | 'bash',
+  ): QueuedMessage {
+    return {
       text,
       agentId: this.harness.interactiveAgentId,
       parts: options?.parts,
@@ -1684,8 +1735,7 @@ export class KimiTUI {
           : undefined,
       mode,
       inlineSkillActivations: options?.inlineSkillActivations,
-    });
-    this.track('input_queue');
+    };
   }
 
   beginSessionRequest(): void {
@@ -1970,53 +2020,23 @@ export class KimiTUI {
   }
 
   private sendMessage(session: Session, input: string, options?: SendMessageOptions): void {
-    const phase = this.state.appState.streamingPhase;
-    // Tower mode keeps the main agent as a long-lived coordinator: while its
-    // turn is live, new input steers into that turn instead of queueing
-    // behind it, so consecutive /tower objectives are accepted immediately
-    // rather than serialized one turn at a time. A foreground shell command
-    // ('shell') has no turn to steer into and keeps queue semantics, as do
-    // input deferral and compaction.
-    const steerIntoCoordinator =
-      this.state.appState.towerMode &&
-      phase !== 'idle' &&
-      phase !== 'shell' &&
-      !this.deferUserMessages &&
-      !this.state.appState.isCompacting;
     // Submission order must survive a mid-turn compaction: objectives queued
     // while compacting stay queued when the turn outlives the compaction, so
     // steering this input ahead of them would reorder the conversation.
     // Prompt-only backlog rides along in the same steer batch, ahead of the
     // new input; a non-steerable backlog (bash, slash-skill, inline-skill
     // bundle) cannot, and then this input queues behind it instead.
-    const backlog = this.state.queuedMessages;
-    const backlogSteerable = backlog.every(
-      (m) => m.inlineSkillActivations === undefined && m.mode !== 'bash' && m.mode !== 'skill',
-    );
-    if (steerIntoCoordinator && backlogSteerable) {
+    if (
+      this.canSteerQueueIntoRunningTurn() &&
+      this.state.queuedMessages.every(isSteerableQueuedMessage)
+    ) {
       // Same lease hand-off as the queue path below: the pre-dispatch lease
-      // defers to the raw ids on the steer item, which re-leases inside
+      // defers to the raw ids on the queue item, which re-leases inside
       // steerMessage and binds to the running turn.
       this.staging.defer(options?.lease);
-      const items: SteerInputItem[] = [
-        ...backlog.map((m) => ({
-          text: m.text,
-          parts: m.parts,
-          imageAttachmentIds: m.imageAttachmentIds,
-          videoAttachmentIds: m.videoAttachmentIds,
-        })),
-        {
-          text: input,
-          parts: options?.parts,
-          imageAttachmentIds: options?.imageAttachmentIds,
-          videoAttachmentIds: options?.videoAttachmentIds,
-        },
-      ];
-      if (backlog.length > 0) {
-        this.state.queuedMessages = [];
-        this.updateQueueDisplay();
-      }
-      this.steerMessage(session, items);
+      this.state.queuedMessages.push(this.toQueuedMessage(input, options));
+      this.updateQueueDisplay();
+      this.steerQueuedMessagesIntoRunningTurn();
       return;
     }
     if (
@@ -2033,7 +2053,99 @@ export class KimiTUI {
     this.sendMessageInternal(session, input, options);
   }
 
-  steerMessage(session: Session, input: readonly SteerInputItem[]): void {
+  // Tower mode keeps the main agent as a long-lived coordinator: while its
+  // turn is live, input steers into that turn instead of queueing behind it,
+  // so consecutive /tower objectives are accepted immediately rather than
+  // serialized one turn at a time. A running WaitFor steers the same way: the
+  // steer ends the wait at once and the model reads the new input, instead of
+  // the input queueing until the wait times out. A foreground shell command
+  // ('shell') has no turn to steer into and keeps queue semantics, as do
+  // input deferral and compaction.
+  private canSteerQueueIntoRunningTurn(): boolean {
+    const phase = this.state.appState.streamingPhase;
+    return (
+      (this.state.appState.towerMode || this.streamingUI.isWaitForRunning()) &&
+      phase !== 'idle' &&
+      phase !== 'shell' &&
+      !this.deferUserMessages &&
+      !this.state.appState.isCompacting
+    );
+  }
+
+  /** Steers the whole queue into the running turn when it is prompt-only.
+   *  The steered items stay at the front of the queue while the steer is in
+   *  flight, and the queue holds (see `shiftQueuedMessage`) so nothing queued
+   *  behind them dispatches first: success removes them, failure leaves them
+   *  queued in place, and a queue left behind by an ended turn drains once
+   *  the steer settles. */
+  steerQueuedMessagesIntoRunningTurn(): void {
+    const session = this.session;
+    if (session === undefined || this.steeringQueuedMessages.size > 0) return;
+    if (!this.canSteerQueueIntoRunningTurn()) return;
+    const batch = [...this.state.queuedMessages];
+    if (batch.length === 0 || !batch.every(isSteerableQueuedMessage)) return;
+    for (const message of batch) this.steeringQueuedMessages.add(message);
+    this.updateQueueDisplay();
+    // Same expiring-upload refresh as the queue drain (`sendQueuedMessage`):
+    // an image whose daemon upload expired falls back to its retained bytes.
+    const items = batch.map((message) => {
+      const item = toSteerInputItem(message);
+      if (message.parts === undefined) return item;
+      return {
+        ...item,
+        parts: refreshExpiringImageFileRefs(
+          message.parts,
+          message.imageAttachmentIds ?? [],
+          this.imageStore,
+        ),
+      };
+    });
+    this.steerMessage(session, items, (steered) => {
+      for (const message of batch) this.steeringQueuedMessages.delete(message);
+      if (this.session !== session) return;
+      if (steered) {
+        const done = new Set(batch);
+        this.state.queuedMessages = this.state.queuedMessages.filter((m) => !done.has(m));
+      }
+      this.updateQueueDisplay();
+      if (steered && this.canSteerQueueIntoRunningTurn()) {
+        this.steerQueuedMessagesIntoRunningTurn();
+        return;
+      }
+      // A turn that ended while the steer was in flight could not drain the
+      // held queue. A prompt dispatched now while the engine still runs a
+      // turn launched by the steer is queued behind it by the engine, so the
+      // order holds either way.
+      this.drainQueueIfIdle();
+    });
+  }
+
+  isSteeringQueuedMessages(): boolean {
+    return this.steeringQueuedMessages.size > 0;
+  }
+
+  private drainQueueIfIdle(): void {
+    if (
+      this.state.appState.streamingPhase !== 'idle' ||
+      this.deferUserMessages ||
+      this.state.appState.isCompacting ||
+      this.state.queuedMessageDispatchPending
+    ) {
+      return;
+    }
+    this.drainOneQueuedMessage();
+  }
+
+  /** `onSettled`, when given, runs once the steer settles. On a rejection its
+   *  staged media is first handed back to raw ownership and the user entries
+   *  added for it are removed, so the caller can keep the input queued
+   *  instead of losing it behind an error; a steer from a session that has
+   *  since been replaced is dropped with that session. */
+  steerMessage(
+    session: Session,
+    input: readonly SteerInputItem[],
+    onSettled?: (steered: boolean) => void,
+  ): void {
     if (this.deferUserMessages || this.state.appState.isCompacting) {
       for (const item of input) {
         this.enqueueMessage(item.text, item);
@@ -2047,8 +2159,9 @@ export class KimiTUI {
       return;
     }
 
+    const steeredEntries: TranscriptEntry[] = [];
     for (const item of input) {
-      this.appendTranscriptEntry({
+      const entry: TranscriptEntry = {
         id: nextTranscriptId(),
         kind: 'user',
         turnId: this.streamingUI.getTurnContext().turnId,
@@ -2058,7 +2171,9 @@ export class KimiTUI {
           item.imageAttachmentIds !== undefined && item.imageAttachmentIds.length > 0
             ? item.imageAttachmentIds
             : undefined,
-      });
+      };
+      steeredEntries.push(entry);
+      this.appendTranscriptEntry(entry);
     }
 
     // Dedupe per item, not across the batch: each queued message retained a
@@ -2084,9 +2199,41 @@ export class KimiTUI {
             ),
           },
     );
-    this.staging.trackDispatch(stagingLease, session.steer(combineSteerInput(resolvedInput)), (error) => {
+    const request = session.steer(combineSteerInput(resolvedInput));
+    if (onSettled !== undefined) {
+      void request.then(
+        () => onSettled(true),
+        () => {},
+      );
+    }
+    this.staging.trackDispatch(stagingLease, request, (error) => {
+      if (onSettled !== undefined) {
+        if (this.session !== session) {
+          onSettled(false);
+          return;
+        }
+        this.staging.defer(stagingLease);
+        this.removeTranscriptEntries(steeredEntries);
+        onSettled(false);
+      }
       this.showError(`Failed to steer: ${formatErrorMessage(error)}`);
     });
+  }
+
+  private removeTranscriptEntries(entries: readonly TranscriptEntry[]): void {
+    const doomed = new Set(entries);
+    const componentsToRemove = this.state.transcriptContainer.children.filter((child) => {
+      const entry = getTranscriptComponentEntry(child);
+      return entry !== undefined && doomed.has(entry);
+    });
+    for (const child of componentsToRemove) {
+      // pi-tui Container.removeChild (not a DOM node); `child.remove()` does not exist.
+      // oxlint-disable-next-line unicorn/prefer-dom-node-remove
+      this.state.transcriptContainer.removeChild(child);
+      if (hasDispose(child)) child.dispose();
+    }
+    this.state.transcriptEntries = this.state.transcriptEntries.filter((e) => !doomed.has(e));
+    this.state.ui.requestRender();
   }
 
   steerSkillActivation(session: Session, skillName: string, skillArgs: string): void {
@@ -2115,6 +2262,7 @@ export class KimiTUI {
   shiftQueuedMessage(): QueuedMessage | undefined {
     if (this.state.queuedMessages.length === 0) return undefined;
     const [first, ...rest] = this.state.queuedMessages;
+    if (this.steeringQueuedMessages.has(first!)) return undefined;
     this.state.queuedMessages = rest;
     return first;
   }
@@ -2363,7 +2511,7 @@ export class KimiTUI {
       return undefined;
     }
     this.resetSessionRuntime();
-    await this.setSession(session);
+    await this.setSession(session, 0);
     this.setAppState({ sessionId: session.id });
     try {
       await this.activateRuntime();
@@ -2390,7 +2538,10 @@ export class KimiTUI {
     return session;
   }
 
-  async setSession(session: Session): Promise<void> {
+  async setSession(
+    session: Session,
+    initialUserTurnCount = session.getResumeState()?.agents[MAIN_AGENT_ID]?.userTurnCount,
+  ): Promise<void> {
     const previous = this.unloadCurrentSession('switching session');
     await previous?.close();
     // A session switch abandons the previous session's in-flight staging
@@ -2403,6 +2554,7 @@ export class KimiTUI {
     // before the engine's intake can read it.
     if (previous !== undefined) this.staging.releaseAll();
     this.session = session;
+    this.surveyController.seedUserTurnCount(initialUserTurnCount);
     this.harness.setTelemetryContext({ sessionId: session.id });
     this.registerSessionHandlers(session);
     this.syncAdditionalDirs(session);
@@ -2724,6 +2876,9 @@ export class KimiTUI {
 
     this.resetSessionRuntime();
     this.session = session;
+    this.surveyController.seedUserTurnCount(
+      session.getResumeState()?.agents[MAIN_AGENT_ID]?.userTurnCount,
+    );
     this.harness.setTelemetryContext({ sessionId: session.id });
     this.registerSessionHandlers(session);
     await this.syncRuntimeState(session);
@@ -2760,7 +2915,7 @@ export class KimiTUI {
     }
 
     this.resetSessionRuntime();
-    await this.setSession(session);
+    await this.setSession(session, 0);
     this.setAppState({ sessionId: session.id });
     try {
       await this.activateRuntime();
@@ -3390,7 +3545,7 @@ export class KimiTUI {
         break;
       }
       case 'thinking': {
-        const spinner = this.ensureActivitySpinner('braille', 'Thinking…', (s) =>
+        const spinner = this.ensureActivitySpinner('braille', 'Working…', (s) =>
           currentTheme.fg('primary', s),
         );
         this.syncAgentSwarmActivitySpinner(undefined);
@@ -3475,7 +3630,7 @@ export class KimiTUI {
         messages: queued,
         isCompacting: this.state.appState.isCompacting,
         isStreaming: this.state.appState.streamingPhase !== 'idle',
-        canSteerImmediately: !this.deferUserMessages,
+        canSteerImmediately: !this.deferUserMessages && !this.isSteeringQueuedMessages(),
       }),
     );
   }
@@ -4244,4 +4399,21 @@ export class KimiTUI {
     this.patchLivePane({ pendingQuestion: null });
     this.restoreEditor();
   }
+}
+
+function isSteerableQueuedMessage(message: QueuedMessage): boolean {
+  return (
+    message.inlineSkillActivations === undefined &&
+    message.mode !== 'bash' &&
+    message.mode !== 'skill'
+  );
+}
+
+function toSteerInputItem(message: QueuedMessage): SteerInputItem {
+  return {
+    text: message.text,
+    parts: message.parts,
+    imageAttachmentIds: message.imageAttachmentIds,
+    videoAttachmentIds: message.videoAttachmentIds,
+  };
 }

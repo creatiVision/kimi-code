@@ -56,6 +56,7 @@ import type { SurveyController } from '#/tui/controllers/survey-controller';
 import { handleFeedbackCommand } from '#/tui/commands/info';
 import { copyTextToClipboard } from '#/utils/clipboard/clipboard-text';
 import { openUrl } from '#/utils/open-url';
+import { readSurveyLastShownTime } from '#/utils/survey-state-store';
 import { createFeedbackArchivePath } from '../../src/feedback/archive';
 import { packageCodebase, scanCodebase } from '../../src/feedback/codebase';
 import { uploadArchive } from '../../src/feedback/upload';
@@ -139,6 +140,9 @@ interface MessageDriver {
   clearQueuedMessages(): void;
   closeSession(reason: string): Promise<void>;
   setSession(session: unknown): Promise<void>;
+  switchToSession(session: Session, statusMessage: string): Promise<void>;
+  reloadCurrentSessionView(session: Session, statusMessage: string): Promise<void>;
+  createNewSession(): Promise<void>;
   syncRuntimeState(session?: unknown): Promise<void>;
   getCurrentSessionId(): string;
 }
@@ -245,6 +249,7 @@ function makeSession(overrides: Record<string, unknown> = {}) {
           },
           context: { history: [] },
           replay: [],
+          userTurnCount: 0,
         },
       },
     })),
@@ -3499,6 +3504,30 @@ command = "vim"
     expect(harness.deleteFile).toHaveBeenCalledTimes(1);
   });
 
+  it('force-exits instead of waiting for shutdown hooks when Ctrl+C is pressed during stop', async () => {
+    const { driver } = await makeDriver();
+    const stopUiForExit = vi
+      .spyOn(driver as unknown as { stopUiForExit(): void }, 'stopUiForExit')
+      .mockImplementation(() => {});
+    const onExit = vi.fn(async () => {});
+    (driver as unknown as { onExit?: (exitCode?: number) => Promise<void> }).onExit = onExit;
+    let captured: ((data: string) => { consume?: boolean } | undefined) | undefined;
+    vi.spyOn(driver.state.ui, 'addInputListener').mockImplementation(((listener: unknown) => {
+      captured = listener as (data: string) => { consume?: boolean } | undefined;
+      return () => {};
+    }) as never);
+    vi.spyOn(driver, 'closeSession').mockReturnValue(new Promise<void>(() => {}));
+
+    const stopped = (driver as unknown as { stop(): Promise<void> }).stop();
+    stopped.catch(() => {});
+
+    expect(captured).toBeDefined();
+    expect(captured?.('\u0003')).toEqual({ consume: true });
+    expect(captured?.('a')).toBeUndefined();
+    expect(stopUiForExit).toHaveBeenCalledOnce();
+    expect(onExit).toHaveBeenCalledWith(130);
+  });
+
   it('releases goal-steered staging media when the running goal turn ends', async () => {
     const { driver, session, harness } = await makeDriver();
     const imageStore = (driver as unknown as { imageStore: ImageAttachmentStore }).imageStore;
@@ -3695,10 +3724,355 @@ command = "vim"
 
     expect(session.steer).toHaveBeenCalledWith('second objective');
     expect(session.prompt).not.toHaveBeenCalled();
-    expect(driver.state.queuedMessages).toEqual([]);
+    await vi.waitFor(() => {
+      expect(driver.state.queuedMessages).toEqual([]);
+    });
     expect(driver.state.transcriptEntries).toEqual([
       expect.objectContaining({ kind: 'user', content: 'second objective' }),
     ]);
+  });
+
+  function waitForEvent(
+    type: 'tool.call.started' | 'tool.progress' | 'tool.result',
+    extra: Record<string, unknown> = {},
+  ): Event {
+    const base = { agentId: 'main', sessionId: 'ses-1', turnId: 1, toolCallId: 'call_wait' };
+    if (type === 'tool.call.started') {
+      return { type, ...base, name: 'WaitFor', args: { timeout: 60 }, ...extra } as Event;
+    }
+    if (type === 'tool.progress') {
+      return {
+        type,
+        ...base,
+        update: { kind: 'status', text: 'Waiting 0s / 1m · 1 background task still running', replace: true },
+        ...extra,
+      } as Event;
+    }
+    return { type, ...base, output: 'wait_status: timed_out', ...extra } as Event;
+  }
+
+  function startWaitFor(driver: MessageDriver, extra: Record<string, unknown> = {}): void {
+    driver.sessionEventHandler.handleEvent(waitForEvent('tool.call.started', extra), () => {});
+    driver.sessionEventHandler.handleEvent(waitForEvent('tool.progress', extra), () => {});
+  }
+
+  function pendingSteer(): { session: ReturnType<typeof makeSession>; resolve: () => void; reject: (error: Error) => void } {
+    let resolve!: () => void;
+    let reject!: (error: Error) => void;
+    const session = makeSession({
+      steer: vi.fn(
+        () =>
+          new Promise<void>((res, rej) => {
+            resolve = res;
+            reject = rej;
+          }),
+      ),
+    });
+    return { session, resolve: () => resolve(), reject: (error) => reject(error) };
+  }
+
+  it('steers fresh input into the running turn while a WaitFor call is running', async () => {
+    const { driver, session } = await makeDriver();
+    driver.state.appState.streamingPhase = 'waiting';
+    startWaitFor(driver);
+
+    driver.handleUserInput('stop waiting and check this');
+
+    expect(session.steer).toHaveBeenCalledWith('stop waiting and check this');
+    expect(session.prompt).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(driver.state.queuedMessages).toEqual([]);
+    });
+  });
+
+  it('steers messages queued before a WaitFor starts into the running turn', async () => {
+    const { driver, session } = await makeDriver();
+    driver.state.appState.streamingPhase = 'waiting';
+    driver.handleUserInput('first note');
+    driver.handleUserInput('second note');
+    expect(driver.state.queuedMessages).toHaveLength(2);
+
+    startWaitFor(driver);
+
+    expect(session.steer).toHaveBeenCalledTimes(1);
+    expect(session.steer).toHaveBeenCalledWith('first note\n\nsecond note');
+    await vi.waitFor(() => {
+      expect(driver.state.queuedMessages).toEqual([]);
+    });
+  });
+
+  it('refreshes an expired queued image upload before steering it into a WaitFor', async () => {
+    const { driver, session } = await makeDriver();
+    const imageStore = (driver as unknown as { imageStore: ImageAttachmentStore }).imageStore;
+    const attachment = imageStore.addImage(
+      new Uint8Array([0xaa, 0xbb]),
+      'image/png',
+      1,
+      1,
+      undefined,
+      'file-expired',
+      1,
+    );
+    driver.state.appState.streamingPhase = 'waiting';
+    driver.state.queuedMessages.push({
+      text: `describe ${attachment.placeholder}`,
+      agentId: 'main',
+      parts: [{ type: 'image_url', imageUrl: { url: 'kimi-file://file-expired' } }],
+      imageAttachmentIds: [attachment.id],
+    });
+
+    startWaitFor(driver);
+
+    expect(session.steer).toHaveBeenCalledTimes(1);
+    const steered = JSON.stringify(vi.mocked(session.steer).mock.calls[0]);
+    expect(steered).toContain('data:image/png;base64,qrs=');
+    expect(steered).not.toContain('kimi-file://file-expired');
+  });
+
+  it('does not steer the queue for a WaitFor call that never starts waiting', async () => {
+    const { driver, session } = await makeDriver();
+    driver.state.appState.streamingPhase = 'waiting';
+    driver.handleUserInput('queued note');
+
+    driver.sessionEventHandler.handleEvent(waitForEvent('tool.call.started', { args: { timeout: 600 } }), () => {});
+    driver.handleUserInput('typed while the call was rejected');
+    driver.sessionEventHandler.handleEvent(waitForEvent('tool.result', { output: 'invalid arguments', isError: true }), () => {});
+
+    expect(session.steer).not.toHaveBeenCalled();
+    expect(driver.state.queuedMessages).toEqual([
+      { text: 'queued note', agentId: 'main' },
+      { text: 'typed while the call was rejected', agentId: 'main' },
+    ]);
+  });
+
+  it('keeps the queue in place when steering it into a WaitFor fails', async () => {
+    const steer = pendingSteer();
+    const { driver } = await makeDriver(steer.session);
+    driver.state.appState.streamingPhase = 'waiting';
+    driver.handleUserInput('first note');
+    driver.handleUserInput('second note');
+    const queued = [...driver.state.queuedMessages];
+
+    startWaitFor(driver);
+    steer.reject(new Error('session closed'));
+
+    await vi.waitFor(() => {
+      expect(driver.state.transcriptEntries.filter((entry) => entry.kind === 'user')).toEqual([]);
+    });
+    expect(driver.state.queuedMessages).toEqual(queued);
+  });
+
+  it('keeps a queued video upload when steering it into a WaitFor fails', async () => {
+    const steer = pendingSteer();
+    const { driver, harness } = await makeDriver(steer.session);
+    const imageStore = (driver as unknown as { imageStore: ImageAttachmentStore }).imageStore;
+    const attachment = imageStore.addVideo('video/mp4', '/tmp/clip.mp4');
+    imageStore.completeVideo(attachment, { fileId: 'file-v1' });
+    driver.state.appState.streamingPhase = 'waiting';
+    driver.handleUserInput(`describe ${attachment.placeholder}`);
+
+    startWaitFor(driver);
+    steer.reject(new Error('session closed'));
+    await (driver as unknown as { staging: { drain(): Promise<void> } }).staging.drain();
+    driver.sessionEventHandler.handleEvent(
+      { type: 'turn.ended', agentId: 'main', turnId: 1, reason: 'completed' } as Event,
+      () => {},
+    );
+    await (driver as unknown as { staging: { drain(): Promise<void> } }).staging.drain();
+
+    expect(harness.deleteFile).not.toHaveBeenCalledWith('file-v1');
+  });
+
+  it('keeps submission order when a WaitFor steer fails after later input was queued', async () => {
+    const steer = pendingSteer();
+    const { driver } = await makeDriver(steer.session);
+    driver.state.appState.streamingPhase = 'waiting';
+    startWaitFor(driver);
+
+    driver.handleUserInput('check this first');
+    driver.state.queuedMessages.push({ text: 'make build', agentId: 'main', mode: 'bash' });
+    steer.reject(new Error('session closed'));
+
+    await vi.waitFor(() => {
+      expect(driver.state.transcriptEntries.filter((entry) => entry.kind === 'user')).toEqual([]);
+    });
+    expect(driver.state.queuedMessages).toEqual([
+      { text: 'check this first', agentId: 'main' },
+      { text: 'make build', agentId: 'main', mode: 'bash' },
+    ]);
+  });
+
+  it('steers input typed while an earlier WaitFor steer is in flight once it succeeds', async () => {
+    const steer = pendingSteer();
+    const { driver } = await makeDriver(steer.session);
+    driver.state.appState.streamingPhase = 'waiting';
+    startWaitFor(driver);
+
+    driver.handleUserInput('first');
+    driver.handleUserInput('second');
+    expect(steer.session.steer).toHaveBeenCalledTimes(1);
+    steer.resolve();
+
+    await vi.waitFor(() => {
+      expect(steer.session.steer).toHaveBeenCalledTimes(2);
+    });
+    expect(steer.session.steer).toHaveBeenNthCalledWith(2, 'second');
+    expect(driver.state.queuedMessages).toEqual([{ text: 'second', agentId: 'main' }]);
+  });
+
+  it('drains input queued behind a steer that succeeds after the turn ended', async () => {
+    const steer = pendingSteer();
+    const { driver, session } = await makeDriver(steer.session);
+    driver.state.appState.streamingPhase = 'waiting';
+    driver.handleUserInput('earlier note');
+    startWaitFor(driver);
+    driver.state.queuedMessages.push({ text: 'later note', agentId: 'main' });
+
+    driver.sessionEventHandler.handleEvent(
+      { type: 'turn.ended', agentId: 'main', turnId: 1, reason: 'completed' } as Event,
+      () => {},
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(session.prompt).not.toHaveBeenCalled();
+
+    steer.resolve();
+
+    await vi.waitFor(() => {
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+    });
+    expect(vi.mocked(session.prompt).mock.calls[0]?.[0]).toBe('later note');
+  });
+
+  it('does not offer Ctrl-S in the queue pane while a queue steer is in flight', async () => {
+    const steer = pendingSteer();
+    const { driver } = await makeDriver(steer.session);
+    driver.state.appState.streamingPhase = 'waiting';
+    driver.handleUserInput('queued note');
+    expect(stripSgr(driver.state.queueContainer.render(120).join('\n'))).toContain(
+      'ctrl-s to steer immediately',
+    );
+
+    startWaitFor(driver);
+
+    expect(stripSgr(driver.state.queueContainer.render(120).join('\n'))).not.toContain(
+      'ctrl-s to steer immediately',
+    );
+  });
+
+  it('holds the queue behind an in-flight WaitFor steer across turn end', async () => {
+    const steer = pendingSteer();
+    const { driver, session } = await makeDriver(steer.session);
+    driver.state.appState.streamingPhase = 'waiting';
+    driver.handleUserInput('earlier note');
+    startWaitFor(driver);
+    driver.state.queuedMessages.push({ text: 'later note', agentId: 'main' });
+
+    driver.sessionEventHandler.handleEvent(
+      { type: 'turn.ended', agentId: 'main', turnId: 1, reason: 'cancelled' } as Event,
+      () => {},
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(session.prompt).not.toHaveBeenCalled();
+
+    steer.reject(new Error('turn cancelled'));
+
+    await vi.waitFor(() => {
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+    });
+    expect(vi.mocked(session.prompt).mock.calls[0]?.[0]).toBe('earlier note');
+    expect(driver.state.queuedMessages).toEqual([{ text: 'later note', agentId: 'main' }]);
+  });
+
+  it('dispatches failed WaitFor input with its media right away when the turn ended meanwhile', async () => {
+    const steer = pendingSteer();
+    const { driver, harness, session } = await makeDriver(steer.session);
+    const imageStore = (driver as unknown as { imageStore: ImageAttachmentStore }).imageStore;
+    const attachment = imageStore.addVideo('video/mp4', '/tmp/clip.mp4');
+    imageStore.completeVideo(attachment, { fileId: 'file-v1' });
+    driver.state.appState.streamingPhase = 'waiting';
+    startWaitFor(driver);
+    driver.handleUserInput(`describe ${attachment.placeholder}`);
+
+    driver.sessionEventHandler.handleEvent(
+      { type: 'turn.ended', agentId: 'main', turnId: 1, reason: 'cancelled' } as Event,
+      () => {},
+    );
+    expect(harness.deleteFile).not.toHaveBeenCalledWith('file-v1');
+    steer.reject(new Error('turn cancelled'));
+
+    await vi.waitFor(() => {
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+    });
+    const parts = vi.mocked(session.prompt).mock.calls[0]?.[0] as Array<{ type: string; videoUrl?: { url: string } }>;
+    expect(parts).toContainEqual({ type: 'video_url', videoUrl: { url: 'kimi-file://file-v1' } });
+    await (driver as unknown as { staging: { drain(): Promise<void> } }).staging.drain();
+    expect(harness.deleteFile).not.toHaveBeenCalledWith('file-v1');
+    expect(driver.state.queuedMessages).toEqual([]);
+  });
+
+  it('drops failed WaitFor input when the session changed meanwhile', async () => {
+    const steer = pendingSteer();
+    const { driver } = await makeDriver(steer.session);
+    driver.state.appState.streamingPhase = 'waiting';
+    startWaitFor(driver);
+    driver.handleUserInput('for the old session');
+
+    const next = makeSession();
+    (driver as unknown as { resetSessionRuntime(): void }).resetSessionRuntime();
+    (driver as unknown as { session: unknown }).session = next;
+    steer.reject(new Error('session closed'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(driver.state.queuedMessages).toEqual([]);
+    expect(next.prompt).not.toHaveBeenCalled();
+  });
+
+  it('keeps a queue with a bash command queued when a WaitFor starts', async () => {
+    const { driver, session } = await makeDriver();
+    driver.state.appState.streamingPhase = 'waiting';
+    driver.state.queuedMessages = [
+      { text: 'note', agentId: 'main' },
+      { text: 'make build', agentId: 'main', mode: 'bash' },
+    ];
+
+    startWaitFor(driver);
+
+    expect(session.steer).not.toHaveBeenCalled();
+    expect(driver.state.queuedMessages).toHaveLength(2);
+  });
+
+  it('leaves queued messages alone when a tool other than WaitFor reports progress', async () => {
+    const { driver, session } = await makeDriver();
+    driver.state.appState.streamingPhase = 'waiting';
+    driver.handleUserInput('queued note');
+
+    startWaitFor(driver, { toolCallId: 'call_bash', name: 'Bash', args: { command: 'sleep 5' } });
+
+    expect(session.steer).not.toHaveBeenCalled();
+    expect(driver.state.queuedMessages).toEqual([{ text: 'queued note', agentId: 'main' }]);
+  });
+
+  it('queues input again once the WaitFor call has returned', async () => {
+    const { driver, session } = await makeDriver();
+    driver.state.appState.streamingPhase = 'waiting';
+    startWaitFor(driver);
+    driver.sessionEventHandler.handleEvent(waitForEvent('tool.result'), () => {});
+
+    driver.handleUserInput('after the wait');
+
+    expect(session.steer).not.toHaveBeenCalled();
+    expect(driver.state.queuedMessages).toEqual([{ text: 'after the wait', agentId: 'main' }]);
+  });
+
+  it('queues input while only a subagent is running WaitFor', async () => {
+    const { driver, session } = await makeDriver();
+    driver.state.appState.streamingPhase = 'waiting';
+    startWaitFor(driver, { agentId: 'agent-child', toolCallId: 'call_child_wait' });
+
+    driver.handleUserInput('main agent is busy');
+
+    expect(session.steer).not.toHaveBeenCalled();
+    expect(driver.state.queuedMessages).toEqual([{ text: 'main agent is busy', agentId: 'main' }]);
   });
 
   it('prompts immediately while tower mode is active and the session is idle', async () => {
@@ -3753,7 +4127,9 @@ command = "vim"
 
     expect(session.steer).toHaveBeenCalledWith('objective one\n\nobjective two');
     expect(session.prompt).not.toHaveBeenCalled();
-    expect(driver.state.queuedMessages).toEqual([]);
+    await vi.waitFor(() => {
+      expect(driver.state.queuedMessages).toEqual([]);
+    });
   });
 
   it('queues fresh input behind a non-steerable backlog instead of jumping ahead', async () => {
@@ -5790,6 +6166,62 @@ command = "vim"
       vi.fn(),
     );
     expect(driver.state.appState.towerMode).toBe(false);
+  });
+
+  it('renders a marker when tower mode exits because a goal was activated', async () => {
+    const { driver } = await makeDriver();
+
+    driver.sessionEventHandler.handleEvent(
+      {
+        type: 'agent.status.updated',
+        agentId: 'main',
+        sessionId: 'ses-1',
+        towerMode: true,
+      } as Event,
+      vi.fn(),
+    );
+    expect(driver.state.appState.towerMode).toBe(true);
+
+    driver.sessionEventHandler.handleEvent(
+      {
+        type: 'agent.status.updated',
+        agentId: 'main',
+        sessionId: 'ses-1',
+        towerMode: false,
+        towerExitReason: 'mode-mutex',
+      } as Event,
+      vi.fn(),
+    );
+
+    expect(driver.state.appState.towerMode).toBe(false);
+    const transcript = stripSgr(renderTranscript(driver));
+    expect(countOccurrences(transcript, 'Tower mode ended — a goal was activated')).toBe(1);
+  });
+
+  it('does not render the goal-exit marker for a reasonless tower exit', async () => {
+    const { driver } = await makeDriver();
+
+    driver.sessionEventHandler.handleEvent(
+      {
+        type: 'agent.status.updated',
+        agentId: 'main',
+        sessionId: 'ses-1',
+        towerMode: true,
+      } as Event,
+      vi.fn(),
+    );
+    driver.sessionEventHandler.handleEvent(
+      {
+        type: 'agent.status.updated',
+        agentId: 'main',
+        sessionId: 'ses-1',
+        towerMode: false,
+      } as Event,
+      vi.fn(),
+    );
+
+    expect(driver.state.appState.towerMode).toBe(false);
+    expect(stripSgr(renderTranscript(driver))).not.toContain('Tower mode ended');
   });
 
   it('renders swarm mode markers from /swarm commands, not tool-triggered status updates', async () => {
@@ -8930,6 +9362,94 @@ describe('footer ctrl+o hint', () => {
 });
 
 describe('KimiTUI session rating survey', () => {
+  it.each(['startup', 'switch', 'reload'] as const)(
+    'reports cumulative user turns after a %s mount',
+    async (mount) => {
+      process.env['KIMI_CODE_HOME'] = await makeTempHome();
+      vi.spyOn(Math, 'random').mockReturnValue(0);
+      try {
+        const session = makeSession();
+        const resumeState = session.getResumeState();
+        resumeState.agents.main.userTurnCount = 40;
+        session.getResumeState.mockReturnValue(resumeState);
+        const startup = makeStartupInput();
+        startup.cliOptions.session = 'ses-1';
+        const { driver, harness } = await makeDriver(
+          session,
+          { listSessions: vi.fn(async () => [{ id: 'ses-1', workDir: '/tmp/proj-a' }]) },
+          mount === 'startup' ? startup : undefined,
+        );
+        if (mount === 'switch') {
+          emitTurn(driver, 1);
+          await driver.switchToSession(session as unknown as Session, 'Resumed session.');
+        } else if (mount === 'reload') {
+          emitTurn(driver, 1);
+          await driver.reloadCurrentSessionView(session as unknown as Session, 'Reloaded session.');
+        }
+        await readSurveyLastShownTime();
+        vi.useFakeTimers();
+        harness.trackWithContext.mockClear();
+        emitTurn(driver, 41, () => {
+          driver.sessionEventHandler.handleEvent(
+            { type: 'agent.status.updated', agentId: 'main', contextTokens: 205_000 } as Event,
+            () => {},
+          );
+        });
+        await vi.advanceTimersByTimeAsync(2_000);
+
+        expect(harness.trackWithContext).toHaveBeenCalledWith(
+          'long_context_survey',
+          expect.objectContaining({ event_type: 'appeared', user_turn_count: 41 }),
+          { sessionId: 'ses-1' },
+        );
+      } finally {
+        vi.useRealTimers();
+        vi.restoreAllMocks();
+      }
+    },
+  );
+
+  it.each(['lazy', 'new-command'] as const)(
+    'starts from zero when a new session is created through %s',
+    async (creation) => {
+      process.env['KIMI_CODE_HOME'] = await makeTempHome();
+      vi.spyOn(Math, 'random').mockReturnValue(0);
+      try {
+        const session = makeSession({ getResumeState: vi.fn(() => undefined) });
+        const startup = makeStartupInput();
+        startup.cliOptions.model = 'k2';
+        const { driver, harness } = await makeDriver(session, {}, startup);
+        if (creation === 'lazy') {
+          driver.handleUserInput('first question');
+          await vi.waitFor(() => {
+            expect(session.prompt).toHaveBeenCalled();
+          });
+        } else {
+          await driver.createNewSession();
+        }
+        await readSurveyLastShownTime();
+        vi.useFakeTimers();
+        harness.trackWithContext.mockClear();
+        emitTurn(driver, 1, () => {
+          driver.sessionEventHandler.handleEvent(
+            { type: 'agent.status.updated', agentId: 'main', contextTokens: 205_000 } as Event,
+            () => {},
+          );
+        });
+        await vi.advanceTimersByTimeAsync(2_000);
+
+        expect(harness.trackWithContext).toHaveBeenCalledWith(
+          'long_context_survey',
+          expect.objectContaining({ event_type: 'appeared', user_turn_count: 1 }),
+          { sessionId: 'ses-1' },
+        );
+      } finally {
+        vi.useRealTimers();
+        vi.restoreAllMocks();
+      }
+    },
+  );
+
   it('runs the end-to-end rating flow after five user turns', async () => {
     vi.useFakeTimers();
     const homeDir = await makeTempHome();
@@ -9127,10 +9647,16 @@ describe('KimiTUI session rating survey', () => {
       );
 
       vi.useRealTimers();
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
+      const stateFile = join(homeDir, 'feedback-survey-state.json');
+      await vi.waitFor(() => {
+        expect(existsSync(stateFile)).toBe(true);
       });
-      expect(existsSync(join(homeDir, 'feedback-survey-state.json'))).toBe(false);
+      const persisted = JSON.parse(await readFile(stateFile, 'utf-8')) as {
+        version: number;
+        last_shown_time: number;
+      };
+      expect(persisted.version).toBe(1);
+      expect(typeof persisted.last_shown_time).toBe('number');
     } finally {
       vi.useRealTimers();
       vi.restoreAllMocks();

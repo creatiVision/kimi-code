@@ -57,6 +57,7 @@ export interface EditorKeyboardHost {
   }): boolean;
   releaseStagingMedia(mediaAttachmentIds: readonly number[]): void;
   recallLastQueued(): QueuedMessage | undefined;
+  isSteeringQueuedMessages(): boolean;
   showError(msg: string): void;
   track(event: string, props?: Record<string, unknown>): void;
   updateEditorBorderHighlight(text?: string): void;
@@ -84,6 +85,7 @@ export interface EditorKeyboardHost {
 export class EditorKeyboardController {
   private pendingExit: PendingExit | null = null;
   private pendingUndoEsc: { readonly timer: ReturnType<typeof setTimeout> } | null = null;
+  private disposed = false;
 
   constructor(
     private readonly host: EditorKeyboardHost,
@@ -99,7 +101,11 @@ export class EditorKeyboardController {
       host.handleUserInput(text);
     };
 
+    // After dispose (shutdown), consume every key here so no shortcut can fire
+    // while the UI is being torn down — Ctrl+C is handled earlier, at the UI
+    // input-listener level.
     editor.onPreInput = (data: string) => {
+      if (this.disposed) return true;
       if (matchesKey(data, Key.escape)) this.clearPendingExit();
       const consumed = host.surveyController.handlePreInput(data);
       if (consumed) this.clearPendingUndoEsc();
@@ -321,6 +327,10 @@ export class EditorKeyboardController {
         host.state.appState.isCompacting
       )
         return;
+      // An automatic steer of the queue is still in flight: steering more now
+      // could reach the model ahead of it, so the keypress is ignored for
+      // that brief window and the draft stays in the editor.
+      if (host.isSteeringQueuedMessages()) return;
       const text = editor.getText().trim();
       const editorIsBash = editor.inputMode === 'bash';
 
@@ -495,6 +505,7 @@ export class EditorKeyboardController {
   }
 
   dispose(): void {
+    this.disposed = true;
     this.clearPendingExit();
     this.clearPendingUndoEsc();
   }
