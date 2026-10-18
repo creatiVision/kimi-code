@@ -1,3 +1,4 @@
+import { isAbsolute, relative } from 'node:path';
 import { Disposable } from '#/_base/di/lifecycle';
 import { LifecycleScope } from '#/app/scopes';
 import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
@@ -576,11 +577,26 @@ export class FileSessionIndex extends Disposable implements ISessionIndex {
   > {
     const id = query.before ?? query.after;
     if (id === undefined) return { filter: {}, bounds: {} };
+    let u: number | undefined;
     const storedValue: unknown = await this.queryStore.get(sessionCollection(generation), id);
-    const stored = isSessionSummaryShape(storedValue) ? storedValue : undefined;
-    const cursor = stored ?? this.mirror.pending().find((summary) => summary.id === id);
-    if (cursor === undefined) return undefined;
-    const u = cursor.updatedAt;
+    if (isSessionSummaryShape(storedValue)) {
+      u = storedValue.updatedAt;
+    } else {
+      const summary =
+        this.mirror.pending().find((item) => item.id === id) ??
+        (await this.getLegacy(id));
+      if (summary !== undefined) {
+        this.mirror.record(summary);
+        u = summary.updatedAt;
+      } else if (
+        storedValue !== null &&
+        typeof storedValue === 'object' &&
+        typeof (storedValue as Record<string, unknown>)['updatedAt'] === 'number'
+      ) {
+        u = (storedValue as Record<string, unknown>)['updatedAt'] as number;
+      }
+    }
+    if (u === undefined) return undefined;
     if (query.before !== undefined) {
       return {
         bounds: { lte: u },
@@ -662,7 +678,7 @@ export class FileSessionIndex extends Disposable implements ISessionIndex {
 
   private async getLegacy(id: string): Promise<SessionSummary | undefined> {
     const hinted = await this.workspaceHintFor(id);
-    if (hinted !== undefined) {
+    if (hinted !== undefined && this.isSafeBucketId(hinted)) {
       const summary = await readSessionSummary(this.docs, this.sessionsScope, hinted, id);
       if (summary !== undefined) return summary;
     }
@@ -726,6 +742,11 @@ export class FileSessionIndex extends Disposable implements ISessionIndex {
   private async collectAuthoritative(
     workspaceIds: readonly string[] | undefined,
   ): Promise<SessionSummary[]> {
+    const safeWorkspaceIds =
+      workspaceIds === undefined ? undefined : workspaceIds.filter((id) => this.isSafeBucketId(id));
+    if (workspaceIds !== undefined && safeWorkspaceIds!.length === 0) {
+      return [];
+    }
     let collected: SessionSummary[];
     if (
       this.readModelEnabled() &&
@@ -733,11 +754,15 @@ export class FileSessionIndex extends Disposable implements ISessionIndex {
     ) {
       const { summaries } = await this.projector.sharedScanForRead();
       collected =
-        workspaceIds === undefined
+        safeWorkspaceIds === undefined
           ? summaries
-          : summaries.filter((summary) => workspaceIds.includes(summary.workspaceId));
+          : summaries.filter((summary) => safeWorkspaceIds.includes(summary.workspaceId));
     } else {
-      const ids = workspaceIds ?? (await listWorkspaceIds(this.storage, this.sessionsScope));
+      const knownIds = new Set(await listWorkspaceIds(this.storage, this.sessionsScope));
+      const ids =
+        safeWorkspaceIds === undefined
+          ? [...knownIds]
+          : safeWorkspaceIds.filter((id) => knownIds.has(id));
       collected = [];
       for (const workspaceId of ids) {
         for (const sessionId of await listSessionIds(this.storage, this.sessionsScope, workspaceId)) {
@@ -750,10 +775,24 @@ export class FileSessionIndex extends Disposable implements ISessionIndex {
     if (pending.length === 0) return collected;
     const byId = new Map(collected.map((summary) => [summary.id, summary]));
     for (const summary of pending) {
-      if (workspaceIds !== undefined && !workspaceIds.includes(summary.workspaceId)) continue;
+      if (safeWorkspaceIds !== undefined && !safeWorkspaceIds.includes(summary.workspaceId)) continue;
       byId.set(summary.id, summary);
     }
     return [...byId.values()];
+  }
+
+  private isSafeBucketId(id: string): boolean {
+    if (!id || id === '.' || id === '..' || id.includes('/') || id.includes('\\') || id.includes('\0')) {
+      return false;
+    }
+    const root = this.storage.pathFor(this.sessionsScope, '');
+    if (root !== undefined) {
+      const target = this.storage.pathFor(this.sessionsScope, id);
+      if (target === undefined) return false;
+      const rel = relative(root, target);
+      if (rel.startsWith('..') || isAbsolute(rel) || rel !== id) return false;
+    }
+    return true;
   }
 
   private readModelEnabled(): boolean {
