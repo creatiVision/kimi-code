@@ -80,6 +80,8 @@ export const kimiResponsesTrait: OpenAIResponsesTrait = {
   encodeCacheKey: (key) => ({ prompt_cache_key: key }),
 };
 
+export const kimiOpenAIResponsesTrait: OpenAIResponsesTrait = kimiResponsesTrait;
+
 export const kimiOpenAITrait: OpenAITrait = {
   strictThinkingValidation: true,
 
@@ -180,7 +182,5 @@ export const kimiAnthropicTrait: AnthropicTrait = {
   },
 };
 
-export const kimiOpenAIResponsesTrait: OpenAIResponsesTrait = {
-  encodeCacheKey: (key) => ({ prompt_cache_key: key }),
-};
+
 
