@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createKimiHarness, type Event, type KimiHarness } from '#/index';
 
 import { TEST_IDENTITY } from './test-identity';
+import { waitForAgentWireEvent } from './session-runtime-helpers';
 
 const MODEL_URL = 'https://model.example.test/v1/chat/completions';
 
@@ -121,7 +122,10 @@ describe('Session.prompt events', () => {
                       type: 'function',
                       function: {
                         name: 'NotifyUser',
-                        arguments: JSON.stringify({ message: 'Checking the work.' }),
+                        arguments: JSON.stringify({
+                          title: 'Checking the work',
+                          message: 'Reviewing the changed files.',
+                        }),
                       },
                     },
                   ],
@@ -534,8 +538,50 @@ describe('Session.prompt events', () => {
       await harness.closeSession(session.id);
       const resumed = await harness.resumeSession({ id: session.id });
       const resumeState = resumed.getResumeState();
-      expect(resumeState?.agents).toMatchObject({ main: expect.any(Object) });
+      expect(resumeState?.agents).toMatchObject({ main: { userTurnCount: 1 } });
       expect(resumeState?.agents).not.toHaveProperty(agentId);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('preserves started user turns through resume, undo, compaction and reload', async () => {
+    const homeDir = await makeTempDir();
+    const workDir = await makeTempDir();
+    const harness = createKimiHarness({ identity: TEST_IDENTITY, homeDir });
+
+    try {
+      await configureFakeProvider(harness);
+      const source = await harness.createSession({ id: 'ses_user_turn_count', workDir });
+      await runPrompt(source, 'first question', 'first answer');
+      await runPrompt(source, 'second question', 'second answer');
+      await runPrompt(source, 'third question', 'third answer');
+      await source.undoHistory(1);
+      await source.close();
+
+      const resumed = await harness.resumeSession({ id: source.id, replayTurnLimit: 1 });
+      expect(resumed.getResumeState()?.agents['main']).toMatchObject({ userTurnCount: 3 });
+      expect(visibleReplayText(resumed.getResumeState()?.agents['main']?.replay ?? [])).toEqual([
+        'user:second question',
+        'assistant:second answer',
+      ]);
+
+      const snapshot = resumed.getResumeState()!;
+      const { userTurnCount, ...legacyMain } = snapshot.agents['main']!;
+      const legacySnapshot: typeof snapshot = {
+        ...snapshot,
+        agents: { ...snapshot.agents, main: legacyMain },
+      };
+      expect(userTurnCount).toBe(3);
+      expect(legacySnapshot.agents['main']?.userTurnCount).toBeUndefined();
+
+      await resumed.compact();
+      await waitForAgentWireEvent(homeDir, source.id, 'context.apply_compaction');
+      const compacted = await harness.reloadSession({ id: source.id });
+      expect(compacted.getResumeState()?.agents['main']).toMatchObject({ userTurnCount: 3 });
+      await runPrompt(compacted, 'follow-up question', 'follow-up answer');
+      const reloaded = await harness.reloadSession({ id: source.id });
+      expect(reloaded.getResumeState()?.agents['main']).toMatchObject({ userTurnCount: 4 });
     } finally {
       await harness.close();
     }
@@ -553,6 +599,10 @@ describe('Session.prompt events', () => {
       await runPrompt(source, 'second question', 'second answer');
       await runPrompt(source, 'third question', 'third answer');
 
+      const fullFork = await harness.forkSession({ id: source.id });
+      expect(fullFork.getResumeState()?.agents['main']).toMatchObject({ userTurnCount: 3 });
+      await fullFork.close();
+
       const fork = await harness.forkSession({
         id: source.id,
         forkId: 'ses_turn_fork_child',
@@ -561,6 +611,7 @@ describe('Session.prompt events', () => {
       await fork.close();
       const resumed = await harness.resumeSession({ id: fork.id });
       const replayText = visibleReplayText(resumed.getResumeState()?.agents['main']?.replay ?? []);
+      expect(resumed.getResumeState()?.agents['main']).toMatchObject({ userTurnCount: 2 });
 
       expect(replayText).toEqual([
         'user:first question',
@@ -568,6 +619,9 @@ describe('Session.prompt events', () => {
         'user:second question',
         'assistant:second answer',
       ]);
+      await runPrompt(resumed, 'fork follow-up', 'fork answer');
+      const reloaded = await harness.reloadSession({ id: fork.id });
+      expect(reloaded.getResumeState()?.agents['main']).toMatchObject({ userTurnCount: 3 });
     } finally {
       await harness.close();
     }

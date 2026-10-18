@@ -12,6 +12,7 @@ import {
 } from '#/agent/permissionMode/permissionModeOps';
 import { permissionRulesKey } from '#/agent/permissionRules/permissionRulesOps';
 import { pluginSessionStartSnapshotKey } from '#/agent/plugin/agentPluginOps';
+import { changeNotifierSnapshotKey } from '#/agent/changeNotifier/changeNotifierOps';
 import { profileActiveToolsKey, profileKey } from '#/agent/profile/profileOps';
 import { runtimeBindingKey } from '#/agent/runtimeBinding/runtimeBindingOps';
 import { taskKey } from '#/agent/task/taskOps';
@@ -20,7 +21,7 @@ import { userToolKey } from '#/agent/userTool/userToolOps';
 import { fileHistoryKey } from '#/features/fileHistory/fileHistoryOps';
 import { planKey } from '#/features/plan/planOps';
 import { swarmKey } from '#/features/swarm/swarmOps';
-import { towerBaseKey, towerKey, towerOwnerKey } from '#/features/tower/towerOps';
+import { towerKey, towerOwnerKey } from '#/features/tower/towerOps';
 
 export const BUILTIN_REPLAYABLE_STATE_KEYS: readonly ReplayableStateKey<any>[] = [
   contextMemoryKey,
@@ -34,6 +35,7 @@ export const BUILTIN_REPLAYABLE_STATE_KEYS: readonly ReplayableStateKey<any>[] =
   permissionModeConfiguredKey,
   permissionRulesKey,
   pluginSessionStartSnapshotKey,
+  changeNotifierSnapshotKey,
   profileKey,
   profileActiveToolsKey,
   runtimeBindingKey,
@@ -45,5 +47,4 @@ export const BUILTIN_REPLAYABLE_STATE_KEYS: readonly ReplayableStateKey<any>[] =
   swarmKey,
   towerKey,
   towerOwnerKey,
-  towerBaseKey,
 ];
