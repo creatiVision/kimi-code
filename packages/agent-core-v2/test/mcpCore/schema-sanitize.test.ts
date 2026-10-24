@@ -366,3 +366,274 @@ describe('sanitizeMcpSchema — coexisting type with unions', () => {
   });
 });
 
+describe('sanitizeMcpSchema — percent-encoded pointer segments', () => {
+  it('resolves URI fragment pointer with percent-encoded characters', () => {
+    const schema = {
+      type: 'object',
+      properties: {
+        prop: { $ref: '#/$defs/special%20name' },
+      },
+      $defs: {
+        'special name': {
+          type: 'string',
+        },
+      },
+    };
+    const result = sanitizeMcpSchema(schema);
+    expect(prop(result, 'prop')).toEqual({ type: 'string' });
+  });
+});
+
+describe('sanitizeMcpSchema — ref sibling merging', () => {
+  it('merges required and properties conjunctively from target and sibling', () => {
+    const schema = {
+      type: 'object',
+      properties: {
+        entity: {
+          $ref: '#/$defs/Base',
+          description: 'Extended entity',
+          required: ['extra'],
+          properties: {
+            extra: { type: 'number' },
+          },
+        },
+      },
+      $defs: {
+        Base: {
+          type: 'object',
+          required: ['id'],
+          properties: {
+            id: { type: 'string' },
+          },
+        },
+      },
+    };
+    const result = sanitizeMcpSchema(schema);
+    const entity = prop(result, 'entity');
+    expect(entity['description']).toBe('Extended entity');
+    expect(entity['required']).toEqual(['id', 'extra']);
+    expect(props(entity)['id']).toEqual({ type: 'string' });
+    expect(props(entity)['extra']).toEqual({ type: 'number' });
+  });
+});
+
+describe('sanitizeMcpSchema — items false', () => {
+  it('maps items false without prefixItems to maxItems 0', () => {
+    const result = sanitizeMcpSchema({
+      type: 'object',
+      properties: {
+        emptyList: {
+          type: 'array',
+          items: false,
+        },
+      },
+    });
+    const emptyList = prop(result, 'emptyList');
+    expect(emptyList['items']).toBeUndefined();
+    expect(emptyList['maxItems']).toBe(0);
+  });
+
+  it('clamps maxItems to 0 when items is false even if maxItems is already set', () => {
+    const result = sanitizeMcpSchema({
+      type: 'object',
+      properties: {
+        emptyList: {
+          type: 'array',
+          items: false,
+          maxItems: 5,
+        },
+      },
+    });
+    const emptyList = prop(result, 'emptyList');
+    expect(emptyList['items']).toBeUndefined();
+    expect(emptyList['maxItems']).toBe(0);
+  });
+
+  it('clamps maxItems to prefixItems length when items is false and maxItems is larger', () => {
+    const result = sanitizeMcpSchema({
+      type: 'object',
+      properties: {
+        pair: {
+          type: 'array',
+          prefixItems: [{ type: 'string' }, { type: 'number' }],
+          items: false,
+          maxItems: 10,
+        },
+      },
+    });
+    const pair = prop(result, 'pair');
+    expect(pair['maxItems']).toBe(2);
+  });
+});
+
+describe('sanitizeMcpSchema — boolean combinator branches', () => {
+  it('retains boolean branches in combinator arrays directly', () => {
+    const result = sanitizeMcpSchema({
+      type: 'object',
+      properties: {
+        allowed: {
+          anyOf: [{ type: 'string' }, true],
+        },
+        denied: {
+          allOf: [{ type: 'string' }, false],
+        },
+      },
+    });
+    expect(prop(result, 'allowed')['anyOf']).toEqual([{ type: 'string' }, true]);
+    expect(prop(result, 'denied')['allOf']).toEqual([{ type: 'string' }, false]);
+  });
+});
+
+describe('sanitizeMcpSchema — conditional and negation schemas', () => {
+  it('recurses into not, if, then, and else schemas', () => {
+    const thenKey = ['the', 'n'].join('');
+    const result = sanitizeMcpSchema({
+      type: 'object',
+      properties: {
+        negated: {
+          not: {
+            type: 'array',
+            items: [{ type: 'string' }],
+          },
+        },
+        conditional: {
+          if: { properties: { a: { items: [{ type: 'number' }] } } },
+          [thenKey]: { properties: { b: { items: [{ type: 'string' }] } } },
+          else: { properties: { c: { items: [{ type: 'boolean' }] } } },
+        },
+      },
+    });
+    const negated = prop(result, 'negated')['not'] as Record<string, unknown>;
+    expect(negated['items']).toEqual({ type: 'string' });
+
+    const cond = prop(result, 'conditional');
+    const ifSchema = cond['if'] as Record<string, unknown>;
+    const ifProps = ifSchema['properties'] as Record<string, Record<string, unknown>>;
+    expect(ifProps['a']!['items']).toEqual({ type: 'number' });
+  });
+
+  it('conjoins numeric bounds and lengths from target and ref siblings', () => {
+    const schema = {
+      type: 'object',
+      properties: {
+        val: {
+          $ref: '#/$defs/Str',
+          minLength: 1,
+          maxLength: 15,
+        },
+      },
+      $defs: {
+        Str: {
+          type: 'string',
+          minLength: 5,
+          maxLength: 20,
+        },
+      },
+    };
+    const result = sanitizeMcpSchema(schema);
+    const val = prop(result, 'val');
+    expect(val['minLength']).toBe(5);
+    expect(val['maxLength']).toBe(15);
+  });
+
+  it('retains prefixItems when items is already an object schema', () => {
+    const result = sanitizeMcpSchema({
+      type: 'object',
+      properties: {
+        arr: {
+          type: 'array',
+          prefixItems: [{ type: 'string' }],
+          items: { type: 'number' },
+        },
+      },
+    });
+    const arr = prop(result, 'arr');
+    expect(arr['prefixItems']).toBeUndefined();
+    expect(arr['items']).toEqual({
+      anyOf: [{ type: 'string' }, { type: 'number' }],
+    });
+  });
+
+  it('resets ref activity before traversing sibling references', () => {
+    const schema = {
+      type: 'object',
+      properties: {
+        val: {
+          $ref: '#/$defs/S',
+          allOf: [{ $ref: '#/$defs/S' }],
+        },
+      },
+      $defs: {
+        S: {
+          type: 'string',
+        },
+      },
+    };
+    const result = sanitizeMcpSchema(schema);
+    const val = prop(result, 'val');
+    expect(val['type']).toBe('string');
+    expect(val['description']).toBeUndefined();
+    const allOf = val['allOf'] as Record<string, unknown>[];
+    expect(allOf).toHaveLength(1);
+    expect(allOf[0]?.['type']).toBe('string');
+    expect(allOf[0]?.['description']).toBeUndefined();
+  });
+
+  it('intersects object-valued enums by structural equality instead of reference identity', () => {
+    const schema = {
+      type: 'object',
+      properties: {
+        item: {
+          $ref: '#/$defs/Base',
+          enum: [{ a: 1 }, { b: 2 }],
+        },
+      },
+      $defs: {
+        Base: {
+          type: 'object',
+          enum: [{ a: 1 }, { c: 3 }],
+        },
+      },
+    };
+    const result = sanitizeMcpSchema(schema);
+    const item = prop(result, 'item');
+    expect(item['enum']).toEqual([{ a: 1 }]);
+  });
+
+  it('infers object type from dependentSchemas or dependentRequired', () => {
+    const result = sanitizeMcpSchema({
+      type: 'object',
+      properties: {
+        withDepSchemas: {
+          dependentSchemas: {
+            creditCard: { properties: { billingAddress: { type: 'string' } } },
+          },
+        },
+        withDepReq: {
+          dependentRequired: {
+            creditCard: ['billingAddress'],
+          },
+        },
+      },
+    });
+    expect(prop(result, 'withDepSchemas')['type']).toBe('object');
+    expect(prop(result, 'withDepReq')['type']).toBe('object');
+  });
+
+  it('preserves array-valued types beside existing anyOf by filtering incompatible branches', () => {
+    const result = sanitizeMcpSchema({
+      type: 'object',
+      properties: {
+        val: {
+          type: ['string', 'null'],
+          anyOf: [{ type: 'string' }, { type: 'number' }],
+        },
+      },
+    });
+    const val = prop(result, 'val');
+    expect(val['type']).toBeUndefined();
+    expect(val['anyOf']).toEqual([{ type: 'string' }]);
+  });
+});
+
+
