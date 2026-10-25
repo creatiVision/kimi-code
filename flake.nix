@@ -65,7 +65,6 @@
         ./packages/acp-server
         ./packages/agent-core-v2
         ./packages/kap-server
-        ./packages/kaos
         ./packages/klient
         ./packages/kosong
         ./packages/migration-legacy
@@ -73,6 +72,7 @@
         ./packages/node-sdk
         ./packages/oauth
         ./packages/pi-tui
+        ./packages/product
         ./packages/remote-control
         ./packages/telemetry
         ./packages/transcript
@@ -90,7 +90,6 @@
         "@moonshot-ai/acp-server"
         "@moonshot-ai/agent-core-v2"
         "@moonshot-ai/kap-server"
-        "@moonshot-ai/kaos"
         "@moonshot-ai/kosong"
         "@moonshot-ai/migration-legacy"
         "@moonshot-ai/minidb"
@@ -98,6 +97,7 @@
         "@moonshot-ai/kimi-code-oauth"
         "@moonshot-ai/klient"
         "@moonshot-ai/pi-tui"
+        "@moonshot-ai/kimi-code-product"
         "@moonshot-ai/remote-control"
         "@moonshot-ai/kimi-telemetry"
         "@moonshot-ai/transcript"
@@ -158,7 +158,7 @@
               inherit (finalAttrs) pname version src pnpmWorkspaces;
               inherit pnpm;
               fetcherVersion = 3;
-              hash = "sha256-xrn34bQ76s+ouOZPHZ4TBkpTHxG7gZejmx8RqSii2uA=";
+              hash = "sha256-1no6CVTIvsGgNuqbMVvgoOsj6/oh+Ng69mFFgxaxtAk=";
             };
 
             nativeBuildInputs = [

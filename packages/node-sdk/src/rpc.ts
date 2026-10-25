@@ -1,10 +1,9 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 import type { SwarmModeTrigger } from '@moonshot-ai/agent-core-v2/features/swarm/agent/swarm';
-import type { Kaos } from '@moonshot-ai/kaos';
 
 import type { AgentContextData } from '#/context';
-import { ErrorCodes, makeErrorPayload } from '#/errors';
+import { ErrorCodes, KimiError, makeErrorPayload } from '#/errors';
 import type {
   ApprovalHandler,
   Event,
@@ -66,6 +65,8 @@ import type {
   RenameSessionInput,
   ResumeSessionInput,
   ResumedSessionSummary,
+  RefreshProviderModelsOptions,
+  RefreshProviderModelsResponse,
   SessionSummary,
   SessionSummaryPage,
   SkillSummary,
@@ -87,6 +88,7 @@ export interface SessionPromptRpcInput {
 
 export interface SessionPromptWithSkillsRpcInput extends SessionPromptRpcInput {
   readonly skills: readonly PromptSkillActivation[];
+  readonly steerIfActive?: boolean;
 }
 
 export interface SessionIdRpcInput {
@@ -167,11 +169,22 @@ export interface SessionWarningInfo {
   readonly severity: 'info' | 'warning' | 'error';
 }
 
+export interface ConfigSectionChange {
+  readonly domain: string;
+  readonly source: 'load' | 'reload' | 'set';
+  readonly value: unknown;
+  readonly previousValue: unknown;
+}
+
 export abstract class SDKRpcClientBase {
   private readonly interactiveAgentScope = new AsyncLocalStorage<string>();
   private readonly eventListeners = new Set<(event: Event) => void>();
   private readonly approvalHandlers = new Map<string, ApprovalHandler>();
   private readonly questionHandlers = new Map<string, QuestionHandler>();
+  private readonly staleReloadHandlers = new Map<
+    string,
+    (summary: ResumedSessionSummary) => Promise<void>
+  >();
 
   get interactiveAgentId(): string {
     return this.interactiveAgentScope.getStore() ?? MAIN_AGENT_ID;
@@ -183,27 +196,7 @@ export abstract class SDKRpcClientBase {
 
   abstract createSession(input: CreateSessionOptions): Promise<SessionSummary>;
 
-  async createSessionWithKaos(
-    input: CreateSessionOptions,
-    kaos: Kaos,
-    persistenceKaos?: Kaos,
-  ): Promise<SessionSummary> {
-    void kaos;
-    void persistenceKaos;
-    return this.createSession(input);
-  }
-
   abstract resumeSession(input: ResumeSessionInput): Promise<ResumedSessionSummary>;
-
-  async resumeSessionWithKaos(
-    input: ResumeSessionInput,
-    kaos: Kaos,
-    persistenceKaos?: Kaos,
-  ): Promise<ResumedSessionSummary> {
-    void kaos;
-    void persistenceKaos;
-    return this.resumeSession(input);
-  }
 
   abstract reloadSession(input: ReloadSessionRpcInput): Promise<ResumedSessionSummary>;
 
@@ -233,19 +226,21 @@ export abstract class SDKRpcClientBase {
 
   abstract getConfigDiagnostics(): Promise<ConfigDiagnostics>;
 
+  abstract onConfigSectionChanged(listener: (change: ConfigSectionChange) => void): Unsubscribe;
+
   abstract getExperimentalFeatures(): Promise<readonly ExperimentalFeatureState[]>;
 
   abstract setConfig(input: KimiConfigPatch): Promise<KimiConfig>;
 
   abstract removeProvider(providerId: string): Promise<KimiConfig>;
 
-  abstract supportsAtomicSectionReplace(): boolean;
-
   abstract importCustomRegistry(
     options: ImportCustomRegistryOptions,
   ): Promise<ImportCustomRegistryResult>;
 
-  abstract replaceConfigSections(sections: Record<string, unknown>): Promise<void>;
+  abstract refreshProviderModels(
+    options?: RefreshProviderModelsOptions,
+  ): Promise<RefreshProviderModelsResponse>;
 
   abstract uploadFile(data: Uint8Array, options: UploadFileOptions): Promise<FileMeta>;
 
@@ -370,6 +365,13 @@ export abstract class SDKRpcClientBase {
 
   abstract setTowerMode(input: SetSessionTowerModeRpcInput): Promise<void>;
 
+  async getTowerStatus(_input: SessionIdRpcInput): Promise<string> {
+    throw new KimiError(
+      ErrorCodes.NOT_IMPLEMENTED,
+      'Tower status is not implemented for this engine',
+    );
+  }
+
   abstract getPlan(input: SessionIdRpcInput): Promise<SessionPlan>;
 
   abstract clearPlan(input: SessionIdRpcInput): Promise<void>;
@@ -381,6 +383,8 @@ export abstract class SDKRpcClientBase {
   abstract getTodos(input: SessionIdRpcInput): Promise<readonly SessionTodoItem[]>;
 
   abstract undoHistory(input: SessionIdRpcInput & { count: number }): Promise<void>;
+
+  abstract takeOverSessionLock(input: SessionIdRpcInput): Promise<void>;
 
   abstract getContext(input: SessionIdRpcInput): Promise<AgentContextData>;
 
@@ -500,9 +504,28 @@ export abstract class SDKRpcClientBase {
     this.questionHandlers.set(sessionId, handler);
   }
 
+  setStaleReloadHandler(
+    sessionId: string,
+    handler: ((summary: ResumedSessionSummary) => Promise<void>) | undefined,
+  ): void {
+    if (handler === undefined) {
+      this.staleReloadHandlers.delete(sessionId);
+      return;
+    }
+    this.staleReloadHandlers.set(sessionId, handler);
+  }
+
   clearSessionHandlers(sessionId: string): void {
     this.approvalHandlers.delete(sessionId);
     this.questionHandlers.delete(sessionId);
+    this.staleReloadHandlers.delete(sessionId);
+  }
+
+  protected async notifyStaleReload(
+    sessionId: string,
+    summary: ResumedSessionSummary,
+  ): Promise<void> {
+    await this.staleReloadHandlers.get(sessionId)?.(summary);
   }
 
   async requestApproval(

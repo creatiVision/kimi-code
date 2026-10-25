@@ -274,7 +274,7 @@ describe('FullCompaction', () => {
     expect(completeEvent?.args).toEqual({ agentId: 'main', time: '<time>' });
     expect(ctx.lastLlmInput()).toMatchInlineSnapshot(`
       system: <system-prompt>
-      tools: Agent, AgentSwarm, CronCreate, CronDelete, CronList, EnterPlanMode, ExitPlanMode
+      tools: Agent, AgentSwarm, CronCreate, CronDelete, CronList, ExitPlanMode
       messages:
         user: text "old user one"
         assistant: text "old assistant one"
@@ -307,7 +307,7 @@ describe('FullCompaction', () => {
       properties: expect.objectContaining({
         agent_id: 'main',
         source: 'manual',
-        tokens_before: 6_135,
+        tokens_before: 5_788,
         tokens_after: expect.any(Number),
         duration_ms: expect.any(Number),
         compacted_count: 6,
@@ -555,6 +555,7 @@ describe('FullCompaction', () => {
         ],
         { cwd: dir },
       ),
+      cwd: dir,
     });
     ctx.configure({
       provider: CATALOGUED_PROVIDER,
@@ -582,7 +583,7 @@ describe('FullCompaction', () => {
       session_id: 'test-session',
       cwd: dir,
       trigger: 'auto',
-      token_count: 6_135,
+      token_count: 5_788,
     });
     expect(post).toMatchObject({
       hook_event_name: 'PostCompact',
@@ -1616,7 +1617,7 @@ describe('FullCompaction', () => {
 
     expect(ctx.lastLlmInput()).toMatchInlineSnapshot(`
       system: <system-prompt>
-      tools: Agent, AgentSwarm, CronCreate, CronDelete, CronList, EnterPlanMode, ExitPlanMode
+      tools: Agent, AgentSwarm, CronCreate, CronDelete, CronList, ExitPlanMode
       messages:
         user: text "old user one"
         assistant: text "old assistant one"
@@ -1680,7 +1681,7 @@ describe('FullCompaction', () => {
     );
     expect(ctx.lastLlmInput()).toMatchInlineSnapshot(`
       system: <system-prompt>
-      tools: Agent, AgentSwarm, CronCreate, CronDelete, CronList, EnterPlanMode, ExitPlanMode
+      tools: Agent, AgentSwarm, CronCreate, CronDelete, CronList, ExitPlanMode
       messages:
         user: text "old user one"
         assistant: text "old assistant one"
@@ -1845,7 +1846,7 @@ describe('FullCompaction', () => {
     expect(countEvents(events, 'full_compaction.complete')).toBe(0);
     expect(ctx.lastLlmInput()).toMatchInlineSnapshot(`
       system: <system-prompt>
-      tools: Agent, AgentSwarm, CronCreate, CronDelete, CronList, EnterPlanMode, ExitPlanMode
+      tools: Agent, AgentSwarm, CronCreate, CronDelete, CronList, ExitPlanMode
       messages:
         user: text "old user one"
         assistant: text "old assistant one"
@@ -1929,7 +1930,7 @@ describe('FullCompaction', () => {
     expect(ctx.llmInputs()).toMatchInlineSnapshot(`
       call 1:
         system: <system-prompt>
-        tools: Agent, AgentSwarm, CronCreate, CronDelete, CronList, EnterPlanMode, ExitPlanMode
+        tools: Agent, AgentSwarm, CronCreate, CronDelete, CronList, ExitPlanMode
         messages:
           user: text "old user one"
           assistant: text "old assistant one"
@@ -1950,8 +1951,8 @@ describe('FullCompaction', () => {
       event: 'compaction_finished',
       properties: expect.objectContaining({
         source: 'auto',
-        tokens_before: 6_142,
-        tokens_after: 6_159,
+        tokens_before: 5_795,
+        tokens_after: 5_812,
         compacted_count: 7,
         retry_count: 0,
       }),
@@ -3015,7 +3016,7 @@ describe('FullCompaction', () => {
     const events = await ctx.untilTurnEnd();
 
     expect(callCount).toBe(3);
-    expect(compactionMaxCompletionTokens).toEqual([32000]);
+    expect(compactionMaxCompletionTokens).toEqual([undefined]);
     expect(events).toContainEqual(
       expect.objectContaining({
         event: 'compaction.started',
@@ -3108,7 +3109,7 @@ describe('FullCompaction', () => {
       await ctx.untilTurnEnd();
 
       expect(callCount).toBe(3);
-      expect(compactionMaxCompletionTokens).toEqual([undefined]);
+      expect(compactionMaxCompletionTokens).toEqual([Number(maxCompletionTokens)]);
     },
   );
 

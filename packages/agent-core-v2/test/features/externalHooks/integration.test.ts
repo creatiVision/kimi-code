@@ -120,6 +120,7 @@ function stubContextMemory(): IAgentContextMemoryService & {
   return {
     _serviceBrand: undefined,
     get: () => [...messages],
+    prefixRevision: () => 0,
     append: (...inserted) => {
       messages.push(...inserted);
     },
@@ -890,7 +891,7 @@ describe('IExternalHooksRunnerService integration', () => {
     expect(unmatched).toHaveLength(0);
   });
 
-  it('runs session external hooks from lifecycle callbacks', async () => {
+  it('runs session external hooks from lifecycle callbacks and skips idle reclaim and reload', async () => {
     const disposables = new DisposableStore();
     let ix: TestInstantiationService | undefined;
     try {
@@ -948,7 +949,9 @@ describe('IExternalHooksRunnerService integration', () => {
 
       await lifecycle.fireDidCreate('startup');
       await lifecycle.fireDidCreate('resume');
+      await lifecycle.fireDidCreate('reclaimed');
       await lifecycle.fireDidCreate('fork');
+      await lifecycle.fireWillClose('reclaim');
       await lifecycle.fireWillClose('exit');
       await lifecycle.fireWillClose('archive');
 
@@ -1166,6 +1169,7 @@ describe('IExternalHooksRunnerService integration', () => {
       const fired: Array<{
         event: string;
         matcherValue?: unknown;
+        cwd?: string;
         inputData?: unknown;
       }> = [];
       const hookEngine = {
@@ -1173,11 +1177,12 @@ describe('IExternalHooksRunnerService integration', () => {
         triggerBlock: async () => undefined,
         fireAndForgetTrigger: async (
           event: string,
-          args: { matcherValue?: unknown; inputData?: unknown },
+          args: { matcherValue?: unknown; cwd?: string; inputData?: unknown },
         ) => {
           fired.push({
             event,
             matcherValue: args.matcherValue,
+            cwd: args.cwd,
             inputData: args.inputData,
           });
           return [];
@@ -1189,7 +1194,7 @@ describe('IExternalHooksRunnerService integration', () => {
         additionalServices: (reg) => {
           registerStateServices(reg);
           registerTestAgentWireServices(reg, 'wire/external-hooks');
-          reg.defineInstance(IBootstrapService, stubBootstrap());
+          reg.defineInstance(IBootstrapService, { ...stubBootstrap(), cwd: '/launch-dir' });
           reg.defineInstance(ISessionContext, stubSessionContext());
           reg.defineInstance(ISessionMetadata, stubSessionMetadata('My Session'));
           reg.definePartialInstance(IConfigService, {});
@@ -1254,6 +1259,7 @@ describe('IExternalHooksRunnerService integration', () => {
         {
           event: 'TurnStarted',
           matcherValue: 'system_trigger',
+          cwd: '/tmp',
           inputData: {
             sessionTitle: 'My Session',
             turnId: 3,
@@ -1265,6 +1271,7 @@ describe('IExternalHooksRunnerService integration', () => {
         {
           event: 'TurnStarted',
           matcherValue: 'user',
+          cwd: '/tmp',
           inputData: {
             sessionTitle: 'My Session',
             turnId: 4,
@@ -1276,6 +1283,7 @@ describe('IExternalHooksRunnerService integration', () => {
         {
           event: 'UserPromptQueued',
           matcherValue: queuedContent,
+          cwd: '/tmp',
           inputData: {
             sessionTitle: 'My Session',
             promptId: 'p1',
@@ -1286,6 +1294,7 @@ describe('IExternalHooksRunnerService integration', () => {
         {
           event: 'TaskStarted',
           matcherValue: 'process',
+          cwd: '/tmp',
           inputData: {
             sessionTitle: 'My Session',
             taskId: 'task-1',

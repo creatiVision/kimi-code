@@ -3,7 +3,12 @@ import type { SwarmModeTrigger } from '@moonshot-ai/agent-core-v2/features/swarm
 import type { AgentContextData } from '#/context';
 import { ErrorCodes, KimiError, type KimiErrorCode } from '#/errors';
 
-import { type ApprovalHandler, type Event, type QuestionHandler } from '#/events';
+import {
+  type ApprovalHandler,
+  type Event,
+  type QuestionHandler,
+  type StaleReloadHandler,
+} from '#/events';
 import type { SDKRpcClientBase } from '#/rpc';
 import type {
   AddAdditionalDirOptions,
@@ -135,6 +140,25 @@ export class Session {
     this.rpc.setQuestionHandler(this.id, handler);
   }
 
+  /**
+   * When another client has updated this session, calls that start a run
+   * (prompt, steer, compact, …) reload the session from disk and retry once;
+   * `undoHistory` reloads and still rejects with `session.stale`. The handler
+   * runs after the reload, before the retry, so the host can refresh its view.
+   */
+  setStaleReloadHandler(handler: StaleReloadHandler | undefined): void {
+    this.ensureOpen();
+    if (handler === undefined) {
+      this.rpc.setStaleReloadHandler(this.id, undefined);
+      return;
+    }
+    this.rpc.setStaleReloadHandler(this.id, async (summary) => {
+      this.summary = summary;
+      this.resumeState = resumeStateFromSummary(summary);
+      await handler();
+    });
+  }
+
   async prompt(input: string | PromptInput, options?: { promptId?: string }): Promise<void> {
     this.ensureOpen();
     if (options?.promptId !== undefined && options.promptId.length === 0) {
@@ -147,22 +171,17 @@ export class Session {
     });
   }
 
-  /**
-   * Submit one prompt with one or more skill activations bundled into the
-   * same user message: the skills are validated up front (an unknown name
-   * rejects the whole submission), rendered ahead of the prompt in the same
-   * turn, and the bundle undoes as a single anchor. Requires the
-   * agent-core-v2 engine.
-   */
   async promptWithSkills(
     input: string | PromptInput,
     skills: readonly PromptSkillActivation[],
+    options?: { readonly steerIfActive?: boolean },
   ): Promise<void> {
     this.ensureOpen();
     await this.rpc.promptWithSkills({
       sessionId: this.id,
       input: normalizePromptInput(input),
       skills,
+      steerIfActive: options?.steerIfActive,
     });
   }
 
@@ -355,6 +374,11 @@ export class Session {
     await this.rpc.setTowerMode({ sessionId: this.id, enabled, base });
   }
 
+  async getTowerStatus(): Promise<string> {
+    this.ensureOpen();
+    return this.rpc.getTowerStatus({ sessionId: this.id });
+  }
+
   async getPlan(): Promise<SessionPlan> {
     this.ensureOpen();
     return this.rpc.getPlan({ sessionId: this.id });
@@ -382,6 +406,16 @@ export class Session {
   async undoHistory(count: number = 1): Promise<void> {
     this.ensureOpen();
     await this.rpc.undoHistory({ sessionId: this.id, count });
+  }
+
+  /**
+   * Evicts another process's lock on this session so the next call that
+   * fails with `session.occupied` can be retried. If that process is still
+   * running, both processes write to the session until it goes idle.
+   */
+  async takeOverLock(): Promise<void> {
+    this.ensureOpen();
+    await this.rpc.takeOverSessionLock({ sessionId: this.id });
   }
 
   async getTodos(): Promise<readonly SessionTodoItem[]> {

@@ -62,7 +62,7 @@ keep = "all"
 max_attempts_per_step = 10
 reserved_context_size = 50000
 
-[background]
+[task]
 max_running_tasks = 4
 keep_alive_on_exit = false
 
@@ -97,18 +97,19 @@ timeout = 5
 | --- | --- | --- | --- |
 | `default_model` | `string` | — | 默认模型别名，必须在 `models` 中定义 |
 | `default_permission_mode` | `string` | `manual` | 新会话的默认权限模式，可选 `yolo` / `auto`，见 [交互与权限](../guides/interaction.md#三种权限模式) |
-| `default_plan_mode` | `boolean` | `false` | 新会话是否默认以 [Plan 模式](../guides/interaction.md#plan-模式)启动 |
+| `default_plan_mode` | `boolean` | `false` | 新会话是否默认以 [Plan 模式](../guides/interaction.md#plan-模式)启动。非交互模式（`kimi -p`）下不生效 |
 | `merge_all_available_skills` | `boolean` | `true` | 是否合并所有目录中的 Agent Skills |
 | `extra_skill_dirs` | `array<string>` | — | 额外 Skill 搜索目录，叠加到默认目录之上 |
 | `extra_agent_dirs` | `array<string>` | — | 额外自定义 Agent 搜索目录，叠加到默认目录之上 |
 | `builtin_product_skills` | `boolean` | `true` | 是否向模型提供介绍 Kimi Code 自身的内置 Skills |
 | `telemetry` | `boolean` | `true` | 是否启用匿名遥测；显式设为 `false` 时关闭 |
 | `auto_session_title` | `boolean` | `true` | 是否允许客户端自动生成会话标题；显式设为 `false` 时关闭 |
+| `disable_feedback_survey` | `boolean` | `false` | 关闭 CLI 和桌面端偶尔出现的会话评分提示 |
 | [`providers`](#providers) | `table` | `{}` | API 供应商表 |
 | [`models`](#models) | `table` | — | 模型别名表 |
 | [`thinking`](#thinking) | `table` | — | Thinking 模式默认参数 |
 | [`loop_control`](#loop_control) | `table` | — | Agent 循环控制参数 |
-| [`background`](#background) | `table` | — | 后台任务运行参数 |
+| [`task`](#task) | `table` | — | 后台任务与 Tower Agent 运行参数；`background` 为 legacy 配置节名称 |
 | [`tools`](#tools) | `table` | — | 全局工具开关 |
 | [`image`](#image) | `table` | — | 图片压缩参数 |
 | [`services`](#services) | `table` | — | 内置外部服务配置 |
@@ -155,6 +156,7 @@ KIMI_BASE_URL = "https://api.moonshot.ai/v1"
 | `support_efforts` | `array<string>` | 否 | 模型接受的 Thinking 档位；解析时配置值不受支持会回落到模型的 `default_effort` 并同步给 UI；选列表外的值会报错，managed 刷新会改写（固定请用 overrides） |
 | `default_effort` | `string` | 否 | 模型的默认 Thinking 档位；managed/open-platform 刷新可能改写，固定请用 [模型覆盖项](#模型覆盖项) |
 | `off_effort` | `string` | 否 | 关闭 Thinking 时在线上传输的 effort 编码（如 xai grok 的 `none`）；对默认就会推理的模型，这是真正关闭推理的唯一方式 |
+| `upgrade` | `object` | 否 | 自定义 registry 的模型升级声明（`model`、`migration_markdown` 和可选 `retirement_at`）；managed 刷新会改写 |
 | `base_url` | `string` | 否 | 模型级端点覆盖（catalog 导入网关模型时写入）；解析时优先于供应商的 `base_url`，仅与 `protocol` 配合时生效 |
 | `display_name` | `string` | 否 | UI 中显示的名称，未设时回退到 `model` |
 | `reasoning_key` | `string` | 否 | 仅 `openai` 供应商；网关用非标准字段名返回推理内容时才需要设置，默认自动识别 `reasoning_content` 等 |
@@ -184,7 +186,7 @@ max_context_size = 131072
 display_name = "Kimi for Coding (custom)"
 ```
 
-`[models."<alias>".overrides]` 接受普通模型字段，例如 `max_context_size`、`max_input_size`、`max_output_size`、`capabilities`、`display_name`、`reasoning_key`、`adaptive_thinking`、`support_efforts`、`default_effort` 和 `off_effort`。不接受身份 / 路由字段：`provider`、`model`、`protocol`、`beta_api` 和 `base_url`。
+`[models."<alias>".overrides]` 接受普通模型字段，例如 `max_context_size`、`max_input_size`、`max_output_size`、`capabilities`、`display_name`、`reasoning_key`、`adaptive_thinking`、`support_efforts`、`default_effort` 和 `off_effort`。不接受身份 / 路由字段（`provider`、`model`、`protocol`、`beta_api` 和 `base_url`），也不接受由 registry 管理的 `upgrade` 元数据。
 
 无需修改配置文件也可以临时切换模型：通过 `KIMI_MODEL_*` 环境变量在内存里合成一个临时供应商，详见[用环境变量定义模型](./env-vars.md#用环境变量定义模型kimi_model_)。
 
@@ -342,13 +344,15 @@ k3-max = "同一模型的 max Thinking 档位。适合最难的子任务。"
 
 `strategy` 可被环境变量 `KIMI_TOKEN_COUNTING_STRATEGY` 覆盖，优先级高于 `config.toml`。
 
-## `background`
+<a id="background"></a>
 
-`background` 控制后台任务（通过 `Bash` 工具或 `Agent` 工具的 `run_in_background=true` 参数启动）的并发数。
+## `task`
+
+`task` 控制后台任务（通过 `Bash` 工具或 `Agent` 工具的 `run_in_background=true` 参数启动）的并发数。legacy `background` 配置节接受相同字段。同时设置两个配置节时，`task` 中已设置的字段覆盖对应的 `background` 值；未在 `task` 中设置的字段仍沿用旧配置节的值。
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `max_running_tasks` | `integer` | — | 同时运行的最大后台任务数 |
+| `max_running_tasks` | `integer` | — | 同时运行的最大后台任务数；也限制 Tower worker 和 reviewer，Tower 默认上限为 256 |
 | `keep_alive_on_exit` | `boolean` | `false` | 会话关闭时是否保留仍在运行的后台任务；print 模式下仅作 `print_background_mode` 的回退：`true` 等价于 `drain` |
 | `kill_grace_period_ms` | `integer` | `5000` | 任务被请求正常终止后，等待自行结束的宽限时间（毫秒），超时后强制停止 |
 | `bash_auto_background_on_timeout` | `boolean` | `true` | 前台 `Bash` 命令超时后转为后台任务而非终止；设为 `false` 恢复超时即终止 |
@@ -357,7 +361,9 @@ k3-max = "同一模型的 max Thinking 档位。适合最难的子任务。"
 | `print_wait_ceiling_s` | `integer` | `2147483` | 等待/steer 循环的墙钟上限（秒），非 print 模式或 `"exit"` 时无效 |
 | `print_max_turns` | `integer` | `100000` | steer 模式下后台任务触发新 turn 的数量上限，防止 steer 循环失控 |
 
-`keep_alive_on_exit` 可被环境变量 `KIMI_CODE_BACKGROUND_KEEP_ALIVE_ON_EXIT` 覆盖，`max_running_tasks` 可被 `KIMI_CODE_BACKGROUND_MAX_RUNNING_TASKS` 覆盖，`bash_task_timeout_s` 可被 `KIMI_CODE_BACKGROUND_BASH_TASK_TIMEOUT_S` 覆盖，`print_background_mode`、`print_wait_ceiling_s`、`print_max_turns` 可分别被 `KIMI_CODE_BACKGROUND_PRINT_BACKGROUND_MODE`、`KIMI_CODE_BACKGROUND_PRINT_WAIT_CEILING_S`、`KIMI_CODE_BACKGROUND_PRINT_MAX_TURNS` 覆盖，优先级均高于配置文件。
+对 Tower 而言，`max_running_tasks` 同时限制 worker 和 reviewer 的总运行数量。如果两个配置节与 `KIMI_CODE_BACKGROUND_MAX_RUNNING_TASKS` 都未设置该值，默认合计最多运行 256 个。
+
+`keep_alive_on_exit` 可被环境变量 `KIMI_CODE_BACKGROUND_KEEP_ALIVE_ON_EXIT` 覆盖，`max_running_tasks` 可被 `KIMI_CODE_BACKGROUND_MAX_RUNNING_TASKS` 覆盖，`bash_task_timeout_s` 可被 `KIMI_CODE_BACKGROUND_BASH_TASK_TIMEOUT_S` 覆盖，`print_background_mode`、`print_wait_ceiling_s`、`print_max_turns` 可分别被 `KIMI_CODE_BACKGROUND_PRINT_BACKGROUND_MODE`、`KIMI_CODE_BACKGROUND_PRINT_WAIT_CEILING_S`、`KIMI_CODE_BACKGROUND_PRINT_MAX_TURNS` 覆盖，优先级均高于两个配置节。
 
 在 print 模式（`kimi -p "<prompt>"`）下，只要还有未决的后台任务，Kimi Code 在 main agent 的 turn 结束后不会退出：每个任务完成都会以合成 user 消息回馈给 main agent，steer 出新的 turn（默认 `print_background_mode = "steer"`），直到某 turn 结束时没有任何未决任务才退出。该循环受 `print_wait_ceiling_s` 与 `print_max_turns` 约束，默认值都近似不设限。print 模式下后台工作也不会被墙钟超时杀掉：后台 `Bash` 任务默认无超时（`bash_task_timeout_s = 0`），subagent 默认无超时（`[subagent] timeout_ms` 与 `[swarm] timeout_ms` 未显式设置时均为 `0`），只有模型自己能停止任务。将 `print_background_mode` 设为 `"drain"` 可等待任务结束但不回馈结果，设为 `"exit"` 则在 main agent 结束后立即退出。
 
@@ -387,6 +393,7 @@ k3-max = "同一模型的 max Thinking 档位。适合最难的子任务。"
 | --- | --- | --- | --- |
 | `startup_timeout_ms` | `integer` | `30000`（30 秒） | 所有 MCP server 的全局默认连接（启动 + 工具发现）超时（毫秒）；`mcp.json` 的 `startupTimeoutMs` 优先于本节 |
 | `tool_timeout_ms` | `integer` | `60000`（60 秒） | 所有 MCP server 的全局默认单次工具调用超时（毫秒）；`mcp.json` 的 `toolTimeoutMs` 优先于本节 |
+| `default_deferred` | `boolean` | `false` | [按需加载工具](../customization/mcp.md#按需加载工具)的全局默认：设为 `true` 时所有 MCP server 的工具按需加载，除非 server 自行排除；`mcp.json` 中单个 server 的 `deferred` 字段优先于本节 |
 
 `startup_timeout_ms` 和 `tool_timeout_ms` 可分别被环境变量 `KIMI_MCP_STARTUP_TIMEOUT_MS` 和 `KIMI_MCP_TOOL_TIMEOUT_MS` 覆盖，优先级高于配置文件。MCP server 的完整配置方式见 [MCP](../customization/mcp.md)。
 
@@ -426,7 +433,7 @@ slug = "acme-dev"        # 可选
 
 ```toml
 [tools]
-disabled = ["EnterPlanMode", "ExitPlanMode", "mcp__github__*"]
+disabled = ["WebSearch", "FetchURL", "mcp__github__*"]
 ```
 
 ::: warning 注意
@@ -519,7 +526,7 @@ api_key = "sk-xxx"
 
 `permission` 设置会话启动时自动加载的权限规则，控制 Agent 调用工具时是否需要用户确认。规则用 `[[permission.rules]]` 数组表写出，按顺序匹配，第一条命中即生效。
 
-也可以在 `[permission]` 下设置 `dangerous_command_guard = false` 完全关闭内置危险命令策略（"Always Ask" 和 "Ask When Needed" 模式下不再触发危险命令审批；"Never Ask" 模式本就不启用该策略），默认 `true`。环境变量 `KIMI_CODE_DANGEROUS_COMMAND_GUARD=false` 会覆盖文件设置并恢复策略引入前的行为。此开关只适用于已经在 Agent 之外统一命令限权的环境。
+也可以在 `[permission]` 下设置 `dangerous_command_guard = false` 完全关闭所有内置 guard 确认策略：危险命令、敏感文件（如 `.env`、`id_rsa`）访问、git 控制路径访问在 "Always Ask" 和 "Ask When Needed" 模式下不再触发审批（"Never Ask" 模式本就不启用这些策略），默认 `true`。环境变量 `KIMI_CODE_DANGEROUS_COMMAND_GUARD=false` 会覆盖文件设置。全部内置 guard 关闭后，"Ask When Needed" 模式下只有你自己配置的 `ask` 规则仍会要求确认；"Always Ask" 模式下未被自动放行的工具照旧逐个询问。`Read`/`Write`/`Edit` 对秘密文件的硬阻断保持不变。此开关只适用于已经在 Agent 之外统一命令限权的环境。
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
@@ -563,7 +570,7 @@ MCP server 的声明配置写在 `~/.kimi-code/mcp.json` 或项目内 `.kimi-cod
 | `render_latex` | `boolean` | `true` | 将 Markdown 中的 LaTeX 公式渲染为 Unicode 文本；`false` 保留原始源码 |
 | `disable_paste_burst` | `boolean` | `false` | 禁用非 bracketed paste 的粘贴突发兜底；默认开启，避免快速多行粘贴被逐行提交 |
 | `cache_expiry_hint` | `boolean` | `true` | resume 或长时间空闲后发消息时，若上下文缓存可能过期则提醒，可先压缩或新建会话（仅 v2 引擎） |
-| `disable_feedback_survey` | `boolean` | `false` | 关闭输入框上方偶尔出现的会话评分提示 |
+| `auto_session_title` | `boolean` | `true` | 首个完成的轮次后由 TUI 自动生成会话标题；设为 `false` 只关闭 TUI 的触发，不影响 `config.toml` 中的全局 `auto_session_title` |
 | `[editor].command` | `string` | `""` | 编写长输入用的外部编辑器命令；留空则回退到 `$VISUAL` / `$EDITOR` |
 | `[notifications].enabled` | `boolean` | `true` | 是否发送桌面通知 |
 | `[notifications].notification_condition` | `string` | `unfocused` | 何时通知：`unfocused`（仅终端失去焦点时）或 `always`（总是） |
@@ -585,7 +592,7 @@ tui_mode = "regular" # "regular" | "fullscreen"（"fullscreen" 为实验性）
 render_latex = true # false 表示消息中的 LaTeX 公式保留原始源码
 disable_paste_burst = false # true 表示禁用非 bracketed paste 的粘贴突发兜底
 cache_expiry_hint = true # false 表示关闭 resume / 空闲提交时的"缓存已过期"提醒弹窗
-disable_feedback_survey = false # true 表示关闭偶发的会话评分提示
+auto_session_title = true # false 表示 TUI 不在首个完成的轮次后自动生成会话标题
 
 [editor]
 command = "" # 留空则使用 $VISUAL / $EDITOR

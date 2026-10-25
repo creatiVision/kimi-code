@@ -21,7 +21,7 @@ All flags are optional — run `kimi` directly to enter an interactive session:
 | `--prompt <prompt>` | `-p` | Run a single prompt non-interactively and stream the Assistant output to stdout. This mode does not open the TUI |
 | `--output-format <format>` | | Set the non-interactive output format; supports `text` and `stream-json`. Can only be used with `--prompt`; defaults to `text` |
 | `--yolo` | `-y` | Start in Ask When Needed mode: routine edits and commands run automatically; risky actions, questions, and plans still ask |
-| `--auto` | | Start in Never Ask mode: never interrupts you; everything runs and is decided automatically |
+| `--auto` | | Start in Never Ask mode: everything runs and is decided automatically; only plans in Plan mode wait for your review |
 | `--plan` | | Start a new session in Plan mode — the AI will prioritize read-only tools for exploration and planning |
 | `--skills-dir <dir>` | | Load Skills from the specified directory, replacing the automatically discovered user and project directories. Can be repeated |
 | `--agent <name>` | | Start a new session with the specified agent as the main Agent. Cannot be combined with `--session`/`--continue` |
@@ -42,6 +42,8 @@ The following combinations are rejected at startup:
 - `--yolo` and `--auto` are mutually exclusive — the two permission modes cannot be combined
 - `--prompt` cannot be used with `--yolo`, `--auto`, or `--plan` — non-interactive mode uses `auto` permission by default
 - `--output-format` can only be used together with `--prompt`
+
+Nobody can review a plan in non-interactive mode, so `default_plan_mode` is not applied to new sessions. A resumed session that is already in Plan mode still runs and stays in Plan mode, but its plan cannot be approved in non-interactive mode: it waits for your review the next time you open the session with `kimi -r`.
 
 When resuming a session, you can override its saved permission or plan mode by adding `--auto`, `--yolo`, or `--plan`. For example, `kimi --continue --auto` resumes the latest session and switches it to Never Ask mode.
 
@@ -195,6 +197,19 @@ Deprecated — only stops a server started by a version before 0.28.0. Those ver
 #### `kimi web rotate-token`
 
 Generate a new persistent bearer token (written to `~/.kimi-code/server.token`); the previous token stops working immediately. The token is shared by the whole home directory, so every running instance picks the new one up on its next auth check — no restart needed.
+
+### `kimi app`
+
+Open Kimi Code desktop and start a new chat in the current directory or a specified directory:
+
+```sh
+kimi app
+kimi app ~/project
+```
+
+This requires an installed desktop version that supports opening workspaces from the CLI. Relative paths are resolved from the current directory. An existing workspace opens a new draft instead of restoring its previous session.
+
+If the system reports that it cannot open the app, the command suggests `kimi install-desktop`, which opens the download page. This command does not download or install the desktop app automatically.
 
 ### `kimi install-desktop`
 

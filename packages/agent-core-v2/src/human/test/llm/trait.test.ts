@@ -769,6 +769,20 @@ describe('withMaxCompletionTokens', () => {
     );
     expect(client.body()['max_completion_tokens']).toBe(1000);
     expect(client.body()['max_tokens']).toBeUndefined();
+
+    await requester.generate(
+      { model: { ...model, maxContextSize: 1000 } },
+      { messages, usedContextTokens: 40 },
+      { signal: new AbortController().signal },
+    );
+    expect(client.body()['max_completion_tokens']).toBe(960);
+
+    await requester.generate(
+      { model: { ...model, maxContextSize: 1000 }, maxCompletionTokens: 0 },
+      { messages, usedContextTokens: 40 },
+      { signal: new AbortController().signal },
+    );
+    expect(client.body()['max_completion_tokens']).toBeUndefined();
   });
 
   it('uses max_completion_tokens for reasoning models without a trait', async () => {
@@ -820,7 +834,7 @@ describe('withMaxCompletionTokens', () => {
       { messages },
       { signal: new AbortController().signal },
     );
-    expect(client.body()['max_tokens']).toBe(128000);
+    expect(client.body()['max_tokens']).toBe(64000);
 
     const sonnet35 = { ...model, model: 'claude-3-5-sonnet-20241022' };
     await requester.generate(
@@ -1491,7 +1505,7 @@ describe('anthropic thinking kwargs', () => {
     expect(body['output_config']).toEqual({ effort: 'high' });
     expect(body['betaFeatures']).toBeUndefined();
     expect(body['betas']).toEqual(['context-management-2025-06-27']);
-    expect(body['max_tokens']).toBe(128000);
+    expect(body['max_tokens']).toBe(64000);
     expect(client.betaCalled()).toBe(true);
     let bodyMessages = body['messages'] as Record<string, unknown>[];
     expect(bodyMessages[0]?.['content']).toEqual([
@@ -1983,5 +1997,55 @@ describe('google genai base', () => {
     expect(functionPart?.arguments).toBe('{"city":"sf"}');
     expect(finish).toEqual({ finishReason: 'completed', rawFinishReason: 'STOP' });
     expect(messageId).toBe('gemini-resp-1');
+  });
+
+  it.each(['gemini-3-pro-preview', 'gemini-4-argon'])(
+    'encodes thinking as a level for %s',
+    async (modelName) => {
+      const client = stubGoogleClient([
+        { candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }] },
+      ]);
+      const requester = createGoogleGenAIRequester({ clientFactory: client.clientFactory });
+      await requester.generate(
+        { model: { ...model, model: modelName }, thinking: { effort: 'high' } },
+        { messages },
+        { signal: new AbortController().signal },
+      );
+      const config = client.body()['config'] as Record<string, unknown>;
+      expect(config['thinkingConfig']).toEqual({ includeThoughts: true, thinkingLevel: 'HIGH' });
+    },
+  );
+
+  it('encodes effort off for gemini-3 as MINIMAL with thoughts hidden', async () => {
+    const client = stubGoogleClient([
+      { candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }] },
+    ]);
+    const requester = createGoogleGenAIRequester({ clientFactory: client.clientFactory });
+    await requester.generate(
+      { model: { ...model, model: 'gemini-3-pro-preview' }, thinking: { effort: 'off' } },
+      { messages },
+      { signal: new AbortController().signal },
+    );
+    const config = client.body()['config'] as Record<string, unknown>;
+    expect(config['thinkingConfig']).toEqual({ includeThoughts: false, thinkingLevel: 'MINIMAL' });
+  });
+
+  it('rejects effort off for gemini-4 (thinking cannot be disabled)', async () => {
+    const client = stubGoogleClient([
+      { candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }] },
+    ]);
+    const requester = createGoogleGenAIRequester({ clientFactory: client.clientFactory });
+    const events: LlmRequestEvent[] = [];
+    await requester.generate(
+      { model: { ...model, model: 'gemini-4-argon' }, thinking: { effort: 'off' } },
+      { messages },
+      { signal: new AbortController().signal, onEvent: (event) => events.push(event) },
+    );
+    const failed = events.find((event) => event.type === 'llm.failed.syntax');
+    expect(failed).toBeDefined();
+    if (failed?.type !== 'llm.failed.syntax') throw new Error('expected llm.failed.syntax');
+    expect(failed.error.code).toBe('thinking_config');
+    expect(failed.error.message).toContain('always reasons');
+    expect(events.some((event) => event.type === 'llm.sent')).toBe(false);
   });
 });

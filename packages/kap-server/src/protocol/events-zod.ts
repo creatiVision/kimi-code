@@ -296,6 +296,8 @@ export const kimiErrorCodeSchema = z.enum([
   'session.state_not_found',
   'session.state_invalid',
   'session.fork_active_turn',
+  'session.occupied',
+  'session.stale',
   'session.undo_unavailable',
   'session.export_not_found',
   'session.export_missing_version',
@@ -376,7 +378,6 @@ export const kimiErrorCodeSchema = z.enum([
   'session.busy',
   'shell.git_bash_not_found',
   'workspace.not_found',
-  'terminal.not_found',
   'file.not_found',
   'file.too_large',
   'fs.path_not_found',
@@ -651,6 +652,13 @@ export const modelCatalogChangedEventSchema = z.object({
       reason: z.string().min(1),
     }),
   ),
+  retired_default: z
+    .object({
+      from: z.string().min(1),
+      to: z.string().min(1),
+      from_display_name: z.string().min(1),
+    })
+    .optional(),
 });
 
 export const pluginChangedEventSchema = z.object({
