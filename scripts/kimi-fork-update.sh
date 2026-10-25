@@ -204,6 +204,7 @@ fi
 PR_BRANCHES=(
   "feat/skill-group-selector"
   "fix/prompt-cache-key-clean"
+  "fix/latest-with-prompt-cache"
   "fix/session-workdir-resume"
   "fix/mcp-schema-limits"
   "feat/fork-native-updater"
@@ -257,7 +258,7 @@ chmod +x "$XCHG_BIN_DIR/kimi"
 VERSION=$("$BUILT_BIN" --version 2>&1 || echo "0.38.0")
 COMMIT=$(git rev-parse HEAD)
 
-echo "{\"version\":\"$VERSION\",\"commit\":\"$COMMIT\",\"built_at\":\"$(date --iso-8601=seconds)\",\"built_by\":\"$HOST\",\"target\":\"linux-x64\",\"pr_branches\":[\"feat/skill-group-selector\",\"fix/prompt-cache-key-clean\",\"fix/session-workdir-resume\",\"fix/mcp-schema-limits\",\"feat/fork-native-updater\"]}" > "$XCHG_BIN_DIR/build-meta.json"
+echo "{\"version\":\"$VERSION\",\"commit\":\"$COMMIT\",\"built_at\":\"$(date --iso-8601=seconds)\",\"built_by\":\"$HOST\",\"target\":\"linux-x64\",\"pr_branches\":[\"feat/skill-group-selector\",\"fix/latest-with-prompt-cache\",\"fix/session-workdir-resume\",\"fix/mcp-schema-limits\",\"feat/fork-native-updater\"]}" > "$XCHG_BIN_DIR/build-meta.json"
 
 log "Published nach $XCHG_BIN_DIR/kimi (Version $VERSION, Commit ${COMMIT:0:9})"
 
