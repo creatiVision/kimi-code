@@ -74,7 +74,7 @@ export function installCommandFor(
   if (source === 'native') {
     const forkScript = resolveForkUpdateScript();
     if (forkScript !== undefined) {
-      return `bash ${forkScript} --fast`;
+      return `bash ${forkScript} --fast ${version}`;
     }
   }
   switch (source) {
@@ -138,7 +138,7 @@ export function spawnForSource(
     case 'native': {
       const forkScript = resolveForkUpdateScript();
       if (forkScript !== undefined) {
-        return { cmd: 'bash', args: [forkScript, '--auto'] };
+        return { cmd: 'bash', args: [forkScript, '--auto', version] };
       }
       // Native installs self-spawn the hidden downloader sub-command, which
       // stages the binary next to the exe (verified against the release
@@ -189,7 +189,7 @@ function resolveInstallSpawn(
     const forkScript = resolveForkUpdateScript();
     if (forkScript !== undefined) {
       const flag = options?.manual === true ? '--fast' : '--auto';
-      return { resolvedCmd: 'bash', args: [forkScript, flag], shell: false };
+      return { resolvedCmd: 'bash', args: [forkScript, flag, version], shell: false };
     }
     // A user-confirmed install marks the stage as manual so the startup swap
     // applies it even when automatic updates are opted out via env.

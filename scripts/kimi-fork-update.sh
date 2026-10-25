@@ -16,6 +16,7 @@ set -euo pipefail
 
 HOST=$(hostname)
 MODE="${1:---auto}"
+TARGET_VER="${2:-}"
 LOG_FILE="${KIMI_LOG_FILE:-$HOME/.kimi-code/logs/fork-update.log}"
 XCHG_BIN_DIR="${KIMI_XCHG_BIN_DIR:-/media/xchg/ai-tools-data/bin/kimi-builds/linux-x64}"
 BOARD_FILE="${KIMI_BOARD_FILE:-/media/xchg/ai-knowledge-base/shared-kimi-chat-laptop+debian1.md}"
@@ -66,6 +67,7 @@ notify_board() {
 }
 
 fast_deploy() {
+  local target="${1:-$TARGET_VER}"
   local src="$XCHG_BIN_DIR/kimi"
   local meta="$XCHG_BIN_DIR/build-meta.json"
   if [ ! -f "$src" ]; then
@@ -73,7 +75,36 @@ fast_deploy() {
     return 1
   fi
 
-  log "==> Fast Deploy: Kopiere prebuilt Binary aus xchg..."
+  local prebuilt_ver=""
+  if [ -f "$meta" ]; then
+    prebuilt_ver=$(sed -n 's/.*"version":"\([^"]*\)".*/\1/p' "$meta" 2>/dev/null || true)
+  fi
+  if [ -z "$prebuilt_ver" ]; then
+    prebuilt_ver=$("$src" --version 2>&1 || true)
+  fi
+
+  if [ -n "$target" ] && [ -n "$prebuilt_ver" ]; then
+    local cmp
+    cmp=$(node -e '
+      const target = process.argv[1].replace(/^v/, "");
+      const prebuilt = process.argv[2].replace(/^v/, "");
+      function parse(v) { return v.split(".").map(Number); }
+      const [t1 = 0, t2 = 0, t3 = 0] = parse(target);
+      const [p1 = 0, p2 = 0, p3 = 0] = parse(prebuilt);
+      if (t1 > p1 || (t1 === p1 && t2 > p2) || (t1 === p1 && t2 === p2 && t3 > p3)) {
+        process.stdout.write("stale");
+      } else {
+        process.stdout.write("ok");
+      }
+    ' "$target" "$prebuilt_ver" 2>/dev/null || echo "ok")
+
+    if [ "$cmp" = "stale" ]; then
+      log "Prebuilt Binary im xchg hat Version $prebuilt_ver, Zielversion ist aber $target. Fast Deploy übersprungen (xchg-Binary veraltet)."
+      return 1
+    fi
+  fi
+
+  log "==> Fast Deploy: Kopiere prebuilt Binary aus xchg (Version: $prebuilt_ver)..."
   cp -p "$src" "$KIMI_BIN.new"
   chmod +x "$KIMI_BIN.new"
   mv -f "$KIMI_BIN.new" "$KIMI_BIN"
@@ -108,11 +139,11 @@ fi
 # ------------------------------------------------------------------------------
 if [ "$MODE" = "--fast" ]; then
   log "=== Fast Deploy Modus aufgerufen ==="
-  if fast_deploy; then
+  if fast_deploy "$TARGET_VER"; then
     log "=== Fast Deploy erfolgreich beendet ==="
     exit 0
   else
-    log "Fast Deploy nicht möglich. Wechsle zu Full Build."
+    log "Fast Deploy nicht ausreichend oder nicht möglich. Wechsle zu Full Build."
     MODE="--build"
   fi
 fi
@@ -121,12 +152,8 @@ fi
 # Auto Mode: Check if xchg has newer prebuilt binary before doing full build
 # ------------------------------------------------------------------------------
 if [ "$MODE" = "--auto" ]; then
-  if [ -f "$XCHG_BIN_DIR/kimi" ] && [ -f "$KIMI_BIN" ]; then
-    XCHG_TIME=$(stat -c %Y "$XCHG_BIN_DIR/kimi" 2>/dev/null || echo 0)
-    LOCAL_TIME=$(stat -c %Y "$KIMI_BIN" 2>/dev/null || echo 0)
-    if [ "$XCHG_TIME" -gt "$LOCAL_TIME" ]; then
-      log "Prebuilt Binary im xchg ist neuer als lokales Binary ($XCHG_TIME > $LOCAL_TIME). Führe Fast Deploy aus."
-      fast_deploy
+  if [ -f "$XCHG_BIN_DIR/kimi" ]; then
+    if fast_deploy "$TARGET_VER"; then
       exit 0
     fi
   fi
@@ -146,7 +173,7 @@ cd "$FORK_REPO"
 
 # 1. Fetch Remotes
 log "Fetch $UPSTREAM and $FORK_REMOTE..."
-git fetch "$UPSTREAM" main
+git fetch "$UPSTREAM" main --tags
 git fetch "$FORK_REMOTE"
 
 # 2. Reconcile with Upstream
@@ -156,6 +183,22 @@ git merge "$UPSTREAM/main" -m "Merge $UPSTREAM/main into main" || {
   log "Merge von $UPSTREAM/main erfordert manuelle Konfliktlösung."
   exit 1
 }
+
+# 2b. Reconcile release back-sync if target version is ahead of main
+if [ -n "$TARGET_VER" ]; then
+  CURRENT_PKG_VER=$(node -p "require('./apps/kimi-code/package.json').version" 2>/dev/null || echo "")
+  if [ "$CURRENT_PKG_VER" != "$TARGET_VER" ]; then
+    log "Repo-Version ($CURRENT_PKG_VER) weicht von Zielversion ($TARGET_VER) ab. Prüfe Upstream-Release-Backsync..."
+    SYNC_PR=$(gh pr list -R MoonshotAI/kimi-code --search "sync release.*$TARGET_VER" --json number --jq '.[0].number' 2>/dev/null || echo "")
+    if [ -n "$SYNC_PR" ]; then
+      log "Upstream Release Backsync PR #$SYNC_PR gefunden. Integriere..."
+      git fetch "$UPSTREAM" "pull/$SYNC_PR/head:pr-$SYNC_PR" && git merge "pr-$SYNC_PR" -m "Merge MoonshotAI/kimi-code#$SYNC_PR (sync release $TARGET_VER back to main)" || {
+        log "Automatischer Merge von PR #$SYNC_PR fehlgeschlagen."
+        git merge --abort 2>/dev/null || true
+      }
+    fi
+  fi
+fi
 
 # 3. Verify / Merge our 4 PR Branches
 PR_BRANCHES=(
