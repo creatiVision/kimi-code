@@ -261,9 +261,10 @@ echo "{\"version\":\"$VERSION\",\"commit\":\"$COMMIT\",\"built_at\":\"$(date --i
 
 log "Published nach $XCHG_BIN_DIR/kimi (Version $VERSION, Commit ${COMMIT:0:9})"
 
-# 6. Deploy locally (Configs remain untouched)
-cp -p "$BUILT_BIN" "$KIMI_BIN"
-chmod +x "$KIMI_BIN"
+# 6. Deploy locally (Configs remain untouched, atomic swap for running processes)
+cp -p "$BUILT_BIN" "$KIMI_BIN.new"
+chmod +x "$KIMI_BIN.new"
+mv -f "$KIMI_BIN.new" "$KIMI_BIN"
 log "Lokal deployed nach $KIMI_BIN"
 
 # 7. Notify Shared Message Board
