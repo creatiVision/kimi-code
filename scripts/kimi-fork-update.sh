@@ -200,10 +200,9 @@ if [ -n "$TARGET_VER" ]; then
   fi
 fi
 
-# 3. Verify / Merge our 4 PR Branches
+# 3. Verify / Merge our PR Branches
 PR_BRANCHES=(
   "feat/skill-group-selector"
-  "fix/prompt-cache-key-clean"
   "fix/latest-with-prompt-cache"
   "fix/session-workdir-resume"
   "fix/mcp-schema-limits"

@@ -1,18 +1,22 @@
 import { describe, expect, it } from 'vitest';
 
-import { UNKNOWN_CAPABILITY } from '#/llm/capability';
-import { createUserMessage, type Message } from '#/llm/message';
-import type { LlmModel } from '#/llm/model';
-import { createAnthropicRequester } from '#/llm/requester/bases/anthropic/requester';
-import { createOpenAIRequester } from '#/llm/requester/bases/openai/requester';
-import { createOpenAIResponsesRequester } from '#/llm/requester/bases/openai-responses/requester';
-import type { LlmClientContext } from '#/llm/requester/requester';
+import { UNKNOWN_CAPABILITY } from '#/llm-requester/capability';
+import {
+  createAnthropicRequester,
+  createKimiOpenAIRequester,
+  createKimiResponsesRequester,
+  createOpenAIRequester,
+  createOpenAIResponsesRequester,
+} from '#/llm-requester/factories';
+import type { LlmModel } from '#/llm-requester/model';
+import type { LlmClientContext } from '#/llm-requester/requester';
+import { createUserMessage, type Message } from '#/message';
 
 const model: LlmModel = {
   provider: 'test',
   model: 'test-model',
   capability: UNKNOWN_CAPABILITY,
-  baseUrl: 'https://api.openai.com/v1',
+  baseUrl: 'https://example.test/v1',
 };
 const messages: readonly Message[] = [createUserMessage('hi')];
 
@@ -143,7 +147,7 @@ function stubAnthropicClient(events: readonly Record<string, unknown>[]): {
 }
 
 describe('openai requester cacheKey', () => {
-  it('encodes the cache key as prompt_cache_key by default', async () => {
+  it('omits prompt_cache_key for third-party OpenAI endpoints by default', async () => {
     const client = stubOpenAIClient(chatCompletionChunks);
     const requester = createOpenAIRequester({ clientFactory: client.clientFactory });
     await requester.generate(
@@ -155,24 +159,24 @@ describe('openai requester cacheKey', () => {
       { messages },
       { signal: new AbortController().signal },
     );
-    expect(client.body()['prompt_cache_key']).toBe('session-1');
+    expect(client.body()['prompt_cache_key']).toBeUndefined();
     expect(client.body()['stop']).toEqual(['END']);
     expect(client.body()['presence_penalty']).toBe(0.5);
     expect(client.body()['extra_body']).toEqual({ trace_id: 't1' });
   });
 
-  it('omits prompt_cache_key for third-party OpenAI endpoints', async () => {
+  it('sends prompt_cache_key for official OpenAI endpoints', async () => {
     const client = stubOpenAIClient(chatCompletionChunks);
     const requester = createOpenAIRequester({ clientFactory: client.clientFactory });
     await requester.generate(
       {
-        model: { ...model, baseUrl: 'https://integrate.api.nvidia.com/v1' },
+        model: { ...model, baseUrl: 'https://api.openai.com/v1' },
         cacheKey: 'session-1',
       },
       { messages },
       { signal: new AbortController().signal },
     );
-    expect(client.body()['prompt_cache_key']).toBeUndefined();
+    expect(client.body()['prompt_cache_key']).toBe('session-1');
   });
 
   it('sends prompt_cache_key to third-party OpenAI endpoints when KIMI_CODE_OPENAI_PROMPT_CACHE_KEY is set (case-insensitive)', async () => {
@@ -199,10 +203,9 @@ describe('openai requester cacheKey', () => {
     }
   });
 
-  it('lets a trait override the cache key params', async () => {
+  it('encodes the cache key as prompt_cache_key for the kimi requester', async () => {
     const client = stubOpenAIClient(chatCompletionChunks);
-    const requester = createOpenAIRequester({
-      trait: { encodeCacheKey: (key) => ({ custom_cache: key }) },
+    const requester = createKimiOpenAIRequester({
       clientFactory: client.clientFactory,
     });
     await requester.generate(
@@ -210,8 +213,7 @@ describe('openai requester cacheKey', () => {
       { messages },
       { signal: new AbortController().signal },
     );
-    expect(client.body()['custom_cache']).toBe('session-1');
-    expect(client.body()['prompt_cache_key']).toBeUndefined();
+    expect(client.body()['prompt_cache_key']).toBe('session-1');
   });
 
   it('omits prompt_cache_key when no cache key is given', async () => {
@@ -279,13 +281,10 @@ describe('openai-responses requester cacheKey', () => {
     }
   });
 
-  it('preserves prompt_cache_key when a trait provides encodeCacheKey (e.g. Kimi)', async () => {
+  it('preserves prompt_cache_key for the kimi responses requester', async () => {
     const client = stubResponsesClient(responsesStreamEvents);
-    const requester = createOpenAIResponsesRequester({
+    const requester = createKimiResponsesRequester({
       clientFactory: client.clientFactory,
-      trait: {
-        encodeCacheKey: (key) => ({ prompt_cache_key: key }),
-      },
     });
     await requester.generate(
       {
@@ -298,4 +297,3 @@ describe('openai-responses requester cacheKey', () => {
     expect(client.body()['prompt_cache_key']).toBe('session-1');
   });
 });
-
