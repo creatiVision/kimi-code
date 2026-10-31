@@ -11,6 +11,7 @@ import {
   IAgentTaskService,
   type AgentTaskInfo,
 } from '#/agent/task/task';
+import { IAgentLoopService } from '#/agent/loop/loop';
 import {
   SubagentTask,
   type SubagentHandle,
@@ -879,7 +880,7 @@ describe('AgentTaskService', () => {
     });
   });
 
-  it('records failed runtime when proc.wait rejects', async () => {
+  it('records failed environment when proc.wait rejects', async () => {
     const { manager } = createAgentTaskService();
     const taskId = registerProcess(
       manager,
@@ -1299,7 +1300,14 @@ describe('AgentTaskService', () => {
 
   it('clears task deadline timers when completion wins the race', async () => {
     vi.useFakeTimers();
-    const { manager } = createAgentTaskService();
+    const { ctx, manager } = createAgentTaskService();
+    const warmupId = manager.registerTask(
+      agentTask(Promise.resolve({ result: 'done' }), 'warmup task', {
+        timeoutMs: 60_000,
+      }),
+    );
+    await expect(manager.wait(warmupId, 60_000)).resolves.toMatchObject({ status: 'completed' });
+    await vi.advanceTimersByTimeAsync(0);
     const baselineTimerCount = vi.getTimerCount();
     const taskId = manager.registerTask(
       agentTask(Promise.resolve({ result: 'done' }), 'fast deadline task', {
@@ -1308,6 +1316,11 @@ describe('AgentTaskService', () => {
     );
 
     await expect(manager.wait(taskId, 60_000)).resolves.toMatchObject({ status: 'completed' });
+    const loop = ctx.get(IAgentLoopService);
+    for (let i = 0; i < 10 && loop.snapshot().state === 'running'; i += 1) {
+      loop.cancel();
+      await vi.advanceTimersByTimeAsync(0);
+    }
     expect(vi.getTimerCount()).toBeLessThanOrEqual(baselineTimerCount);
   });
 

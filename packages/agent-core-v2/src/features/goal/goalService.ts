@@ -14,6 +14,7 @@ import {
   type AgentActorRestoreEvent,
 } from '#/agent/actorService/agentActorService';
 import { ContextAppendMessage } from '#/agent/contextMemory/contextEvents';
+import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import type { ContextMessage, PromptOrigin } from '#/agent/contextMemory/types';
 import { GoalInjection, GOAL_WAIT_FOR_GUIDANCE } from '#/features/goal/injection/goalInjection';
 import { LOOP_CONTROL_SECTION, type LoopControl } from '#/agent/loop/configSection';
@@ -49,6 +50,7 @@ import {
   type KimiErrorPayload,
 } from '#/errors';
 import { IAgentLifecycleService, MAIN_AGENT_ID } from '#/session/agentLifecycle/agentLifecycle';
+import { Forked } from '#/session/agentLifecycle/forked';
 import { ISessionUsageService } from '#/session/usage/sessionUsage';
 import { IEventDispatcher } from '#/state/eventDispatcher';
 import type { ExecutableToolResult } from '#/tool/toolContract';
@@ -58,7 +60,6 @@ import { IGoalDeadlineScheduler } from './goalDeadlineScheduler';
 import {
   GoalClear,
   GoalCreate,
-  GoalForked,
   GoalUpdate,
   GoalUpdated,
   type GoalModelState,
@@ -79,7 +80,7 @@ import type {
 registerEvent2Class(GoalCreate);
 registerEvent2Class(GoalUpdate);
 registerEvent2Class(GoalClear);
-registerEvent2Class(GoalForked);
+registerEvent2Class(Forked);
 
 const MAX_GOAL_OBJECTIVE_LENGTH = 4000;
 
@@ -726,7 +727,6 @@ function launchContinuationTurn(context: GoalOperationContext, goalId: string, s
           : prompt,
       },
     ],
-    toolCalls: [],
     origin: GOAL_CONTINUATION_ORIGIN,
   };
   const loop = context.runtime.get(IAgentLoopService);
@@ -1201,7 +1201,11 @@ const goalEffects = fromCallback(({
   const disposables: IDisposable[] = [deadline];
   if (input.runtime.agent.agentId === MAIN_AGENT_ID) {
     disposables.push(input.runtime.get(IAgentLifecycleService).onWillClose(handlers.closing));
-    disposables.push(new GoalInjection(handlers.injection, reminderOf(input.runtime)));
+    disposables.push(new GoalInjection(
+      handlers.injection,
+      reminderOf(input.runtime),
+      input.runtime.get(IAgentContextMemoryService),
+    ));
     disposables.push(input.runtime.get(IEventBus).subscribe(TurnStarted, handlers.turnStarted));
     disposables.push(input.runtime.get(ISessionUsageService).onDidRecord(handlers.usageRecorded));
     const loop = input.runtime.get(IAgentLoopService);
@@ -1322,7 +1326,7 @@ export class AgentGoalService extends AgentActorService<GoalRuntimeState> implem
     this.actor = this.attachActor(goalActorLogic, {
       id: 'goal',
       durable: {
-        events: [GoalCreate, GoalUpdate, GoalClear, GoalForked, ContextAppendMessage],
+        events: [GoalCreate, GoalUpdate, GoalClear, Forked, ContextAppendMessage],
         undoable: false,
         transition: (state, event) => {
           if (event instanceof GoalCreate) {
@@ -1375,7 +1379,7 @@ export class AgentGoalService extends AgentActorService<GoalRuntimeState> implem
             state.forkNotice.goalPresent = false;
             return;
           }
-          if (event instanceof GoalForked) {
+          if (event instanceof Forked) {
             state.goal = null;
             state.forkNotice.reminderPending =
               state.forkNotice.goalPresent || state.forkNotice.reminderPending;

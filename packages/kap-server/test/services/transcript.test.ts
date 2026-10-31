@@ -14,6 +14,7 @@ import {
   IAgentTaskService,
   IEventBus,
   IFlagService,
+  IBlobStore,
   ISessionIndex,
   ISessionMetadata,
   ISessionLifecycleService,
@@ -195,7 +196,17 @@ describe('AgentTranscriptProjector', () => {
         display: { kind: 'command', command: 'ls' },
       }),
     );
-    feed(ev({ type: 'tool.result', turnId: 1, toolCallId: 'call_1', output: 'file.txt' }));
+    feed(
+      ev({
+        type: 'tool.result',
+        turnId: 1,
+        toolCallId: 'call_1',
+        output: [
+          { type: 'text', text: 'file.txt' },
+          { type: 'image_url', imageUrl: { url: 'data:image/png;base64,AAAA' } },
+        ],
+      }),
+    );
     feed(ev({ type: 'turn.step.completed', turnId: 1, step: 1, stepId: 'u1' }));
     feed(ev({ type: 'turn.ended', turnId: 1, reason: 'completed' }));
 
@@ -226,7 +237,13 @@ describe('AgentTranscriptProjector', () => {
       name: 'Bash',
       state: 'done',
       input: { command: 'ls' },
-      output: 'file.txt',
+      output: [
+        { type: 'text', text: 'file.txt' },
+        {
+          type: 'image_url',
+          imageUrl: expect.objectContaining({ url: 'data:image/png;base64,AAAA' }),
+        },
+      ],
       display: { kind: 'command', command: 'ls' },
     });
   });
@@ -1931,27 +1948,6 @@ describe('AgentTranscriptProjector', () => {
     expect(steps[1]!.frames.map((f) => f.kind === 'text' && f.taskId)).toEqual(['task_1', 'task_2']);
   });
 
-  it('drops a task notification that is the turn prompt itself', () => {
-    const projector = new AgentTranscriptProjector('main', TEST_SESSION_ID);
-    const tx = new AgentTranscript('main');
-    const feed = (event: ProjectorBusEvent): void => void tx.apply(projector.map(event));
-
-    feed(ev({ type: 'turn.started', turnId: 1, origin: { kind: 'task', taskId: 'task_1' } }));
-    feed(
-      ev({
-        type: 'task.notified',
-        notificationType: 'task.completed',
-        title: 'Background agent completed',
-        body: 'inspect done.',
-        severity: 'info',
-        sourceKind: 'background_task',
-        sourceId: 'task_1',
-      }),
-    );
-    feed(ev({ type: 'turn.step.started', turnId: 1, step: 1 }));
-    expect(turnOps('t1', tx.getItems()).steps[0]!.frames).toHaveLength(0);
-  });
-
   it('keeps a different task’s notification in a task-origin turn', () => {
     const projector = new AgentTranscriptProjector('main', TEST_SESSION_ID);
     const tx = new AgentTranscript('main');
@@ -2066,6 +2062,38 @@ describe('AgentTranscriptProjector', () => {
     tx.apply(projector.mapInteractionResolved('q1', null));
     expect(tx.getInteraction('q1')).toMatchObject({ state: 'dismissed' });
     expect(tx.listPendingInteractions()).toEqual([]);
+  });
+
+  it('marks a question cancelled by the engine as cancelled, not answered', () => {
+    const projector = new AgentTranscriptProjector('main', TEST_SESSION_ID);
+    const tx = new AgentTranscript('main');
+
+    tx.apply(
+      projector.mapInteractionRequested({
+        id: 'q1',
+        kind: 'question',
+        payload: { questions: [{ question: 'Pick', options: [] }] },
+        createdAt: 1000,
+      }),
+    );
+    tx.apply(projector.mapInteractionResolved('q1', { cancelled: true, reason: 'turn_ended' }));
+    expect(tx.getInteraction('q1')).toMatchObject({ state: 'cancelled' });
+  });
+
+  it('keeps an answer keyed by a question named cancelled as answered', () => {
+    const projector = new AgentTranscriptProjector('main', TEST_SESSION_ID);
+    const tx = new AgentTranscript('main');
+
+    tx.apply(
+      projector.mapInteractionRequested({
+        id: 'q2',
+        kind: 'question',
+        payload: { questions: [{ question: 'cancelled', options: [] }] },
+        createdAt: 1000,
+      }),
+    );
+    tx.apply(projector.mapInteractionResolved('q2', { cancelled: true }));
+    expect(tx.getInteraction('q2')).toMatchObject({ state: 'answered' });
   });
 
   it('projects question requests onto the wire shape with stable question/option ids', () => {
@@ -2434,10 +2462,7 @@ describe('AgentTranscriptProjector', () => {
           { type: 'text', text: 'look at this' },
           {
             type: 'image_url',
-            imageUrl: {
-              url: 'kimi-file://f_img9?path=%2Fabs%2Fsession%2Fmedia%2Ff_img9.png',
-              name: 'architecture.png',
-            },
+            imageUrl: { url: 'kimi-file://f_img9?path=%2Fabs%2Fsession%2Fmedia%2Ff_img9.png', name: 'architecture.png' },
           },
         ],
         steeredAt: '2026-01-01T00:00:02.000Z',
@@ -2452,10 +2477,7 @@ describe('AgentTranscriptProjector', () => {
           { type: 'text', text: 'look at this' },
           {
             type: 'image_url',
-            imageUrl: {
-              url: 'kimi-file://f_img9?path=%2Fabs%2Fsession%2Fmedia%2Ff_img9.png',
-              name: 'architecture.png',
-            },
+            imageUrl: { url: 'kimi-file://f_img9?path=%2Fabs%2Fsession%2Fmedia%2Ff_img9.png', name: 'architecture.png' },
           },
         ],
         promptIds: ['p2', 'p3'],
@@ -2780,12 +2802,17 @@ describe('AgentTranscriptProjector', () => {
     try {
       const wireDir = join(home, 'sessions', 'ws', 's1', 'agents', 'main');
       await mkdir(wireDir, { recursive: true });
+      const blobHash = 'a'.repeat(64);
+      const blobBytes = Buffer.from('cold-image-bytes');
       const records = [
         {
           type: 'context.append_message',
           message: {
             role: 'user',
-            content: [{ type: 'text', text: 'hi' }],
+            content: [
+              { type: 'text', text: 'hi' },
+              { type: 'image_url', imageUrl: { url: `blobref:image/png;${blobHash}`, name: 'cold.png' } },
+            ],
             toolCalls: [],
             origin: { kind: 'user' },
           },
@@ -2855,6 +2882,15 @@ describe('AgentTranscriptProjector', () => {
         core: {
           accessor: {
             get: (token: unknown) => {
+              if (token === IBlobStore) {
+                return {
+                  get: async (scope: string, key: string) => {
+                    expect(scope).toBe('sessions/ws/s1/agents/main/blobs');
+                    expect(key).toBe(blobHash);
+                    return blobBytes;
+                  },
+                };
+              }
               if (token === ISessionManager) return { get: () => undefined, list: () => [] };
               if (token === IWorkspaceInstanceManager) {
               return { list: () => [], onDidChange: () => ({ dispose: () => undefined }) };
@@ -2867,6 +2903,15 @@ describe('AgentTranscriptProjector', () => {
       });
       const snapshot = await service.readColdSnapshot('s1', 'main');
       expect(snapshot).toBeDefined();
+      expect(snapshot!.attachments).toEqual([
+        {
+          attachmentId: 'att_1',
+          mediaType: 'image/*',
+          name: 'cold.png',
+          source: { kind: 'url', url: `data:image/png;base64,${blobBytes.toString('base64')}` },
+        },
+      ]);
+      expect(JSON.stringify(snapshot)).not.toContain('blobref:');
 
       expect(snapshot!.tasks).toEqual([
         {
@@ -3160,13 +3205,60 @@ describe('AgentTranscriptProjector', () => {
     }
   });
 
+  it('readColdSnapshot realigns turn ordinals to wire ids and marks the wedged turn', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'transcript-cold-wedged-'));
+    try {
+      const wireDir = join(home, 'sessions', 'ws', 's1', 'agents', 'main');
+      await mkdir(wireDir, { recursive: true });
+      const userTurn = (turnId: number, promptId: string, text: string, time: number) => [
+        { type: 'turn.prompt', turnId, promptId, origin: { kind: 'user' }, time },
+        { type: 'agent.turn.started', turnId, time: time + 1 },
+        { type: 'context.append_message', message: { id: promptId, role: 'user', content: [{ type: 'text', text }], toolCalls: [], origin: { kind: 'user' } }, time },
+        { type: 'context.append_message', message: { role: 'assistant', content: [{ type: 'text', text: `answer ${turnId}` }], toolCalls: [] }, time: time + 2 },
+      ];
+      const foldedNotification = (turnId: number, taskId: string, time: number) => [
+        { type: 'turn.prompt', turnId, promptId: `n${turnId}`, origin: { kind: 'task_notification', taskId }, time },
+        { type: 'context.append_message', message: { id: `n${turnId}`, role: 'user', content: [{ type: 'text', text: `<notification>done ${turnId}</notification>` }], toolCalls: [], origin: { kind: 'task_notification', taskId } }, time },
+      ];
+      const records = [
+        ...userTurn(3, 'u3', 'before the gap', 1000),
+        { type: 'turn.ended', turnId: 3, reason: 'completed', time: 1100 },
+        ...foldedNotification(4, 'bg-4', 2000),
+        ...foldedNotification(5, 'bg-5', 2100),
+        ...userTurn(6, 'u6', 'wedged prompt', 3000),
+        ...userTurn(7, 'u7', 'after restart', 4000),
+        { type: 'turn.ended', turnId: 7, reason: 'completed', time: 4100 },
+      ];
+      await writeFile(
+        join(wireDir, 'wire.jsonl'),
+        records.map((record) => JSON.stringify(record)).join('\n') + '\n',
+      );
+      const snapshot = await coldTranscriptService(home).readColdSnapshot('s1', 'main');
+      const turns = (snapshot?.items ?? []).filter((item) => item.kind === 'turn');
+      expect(turns.map((turn) => [turn.turnId, turn.ordinal, turn.state])).toEqual([
+        ['t3', 3, 'completed'],
+        ['t6', 6, 'failed'],
+        ['t7', 7, 'completed'],
+      ]);
+      const wedged = turns[1];
+      if (wedged?.kind !== 'turn') throw new Error('expected turn');
+      expect(wedged.wedged).toBe(true);
+      expect(wedged.prompt).toBe('wedged prompt');
+      expect(wedged.startedAt).toBe(new Date(3001).toISOString());
+      expect(wedged.endedAt).toBeUndefined();
+      expect(wedged.steps[0]?.stepId).toBe('t6.1');
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   it('readColdSnapshot opens a task-origin turn only when the wire has the turn.prompt boundary', async () => {
     const home = await mkdtemp(join(tmpdir(), 'transcript-cold-taskturn-'));
     try {
       const wireDir = join(home, 'sessions', 'ws', 's1', 'agents', 'main');
       await mkdir(wireDir, { recursive: true });
       const notification =
-        '<notification id="task:task_9:completed" category="task" type="task.completed" source_kind="background_task" source_id="task_9">\nTitle: Background agent completed\nSeverity: info\ninspect done.\n</notification>';
+        '<notification id="task:task_9:completed" category="task" type="task.completed" source_kind="background_task" source_id="task_9">\nTitle: Background agent completed\nSeverity: info\ninspect done.\n<output-file path="/tmp/task_9/output.log" bytes="4">\nRead the output file.\n</output-file>\n</notification>';
       const taskOrigin = { kind: 'task', taskId: 'task_9', status: 'completed', notificationId: 'n1' };
       const opening = [
         { type: 'context.append_message', message: { role: 'user', content: [{ type: 'text', text: 'hi' }], toolCalls: [], origin: { kind: 'user' } }, time: 1000 },
@@ -3184,6 +3276,35 @@ describe('AgentTranscriptProjector', () => {
         .filter((item) => item.kind === 'turn')
         .map((item) => (item.kind === 'turn' ? item.origin.kind : ''));
       expect(originKinds).toEqual(['user', 'task']);
+      const coldTaskTurn = withBoundary!.items.find(
+        (item): item is TranscriptTurn => item.kind === 'turn' && item.origin.kind === 'task',
+      );
+      if (coldTaskTurn === undefined) throw new Error('expected cold task turn');
+      expect(coldTaskTurn.prompt).toBe(notification);
+
+      const projector = new AgentTranscriptProjector('main', TEST_SESSION_ID);
+      const liveTx = new AgentTranscript('main');
+      const feed = (event: ProjectorBusEvent): void => void liveTx.apply(projector.map(event));
+      feed(ev({ type: 'turn.prompt', turnId: 1, input: [{ type: 'text', text: notification }], origin: taskOrigin }));
+      feed(ev({ type: 'turn.started', turnId: 1, origin: taskOrigin }));
+      feed(ev({
+        type: 'task.notified',
+        notificationType: 'task.completed',
+        title: 'Background agent completed',
+        body: 'inspect done.',
+        severity: 'info',
+        sourceKind: 'background_task',
+        sourceId: 'task_9',
+      }));
+      feed(ev({ type: 'turn.step.started', turnId: 1, step: 1 }));
+      liveTx.apply(healTurnOps(coldTaskTurn, turnOps('t1', liveTx.getItems())));
+      const healed = turnOps('t1', liveTx.getItems());
+      expect(healed.prompt).toBe(notification);
+      expect(
+        healed.steps.flatMap((step) => step.frames).filter(
+          (frame) => frame.kind === 'text' && frame.role === 'user' && frame.taskId === 'task_9',
+        ),
+      ).toHaveLength(0);
 
       await write([...opening, delivered, reply]);
       const withoutBoundary = await coldTranscriptService(home).readColdSnapshot('s1', 'main');
@@ -3815,6 +3936,57 @@ describe('bindSessionTranscript', () => {
       .filter((op): op is InteractionUpsertOp => op.op === 'interaction.upsert')
       .map((op) => op.interaction.state);
     expect(states).toEqual(['pending', 'approved']);
+    binding.dispose();
+  });
+
+  it('projects the observable task prompt and keeps one notification after heal', () => {
+    const notification = '<notification id="task:task_1:completed" category="task" type="task.completed" source_kind="background_task" source_id="task_1">\nTitle: Background agent completed\nSeverity: info\ninspect done.\n<output-file path="/tmp/task_1/output.log" bytes="4">\nRead the output file.\n</output-file>\n</notification>';
+    const agents = new FakeAgents();
+    const store = new TranscriptStore('s1');
+    const binding = bindSessionTranscript(store, fakeSession(agents));
+    const main = agents.add('main');
+
+    main.bus.emit(ev({
+      type: 'turn.prompt',
+      turnId: 1,
+      input: [{ type: 'text', text: notification }],
+      origin: { kind: 'task', taskId: 'task_1' },
+    }));
+    main.bus.emit(ev({
+      type: 'turn.started',
+      turnId: 1,
+      origin: { kind: 'task', taskId: 'task_1' },
+    }));
+    main.bus.emit(ev({
+      type: 'task.notified',
+      notificationType: 'task.completed',
+      title: 'Background agent completed',
+      body: 'inspect done.',
+      severity: 'info',
+      sourceKind: 'background_task',
+      sourceId: 'task_1',
+    }));
+    main.bus.emit(ev({ type: 'turn.step.started', turnId: 1, step: 1 }));
+
+    const transcript = store.ensureAgent('main');
+    const live = turnOps('t1', transcript.getItems());
+    expect(live.prompt).toBe(notification);
+    expect(live.steps[0]!.frames).toHaveLength(0);
+
+    const coldTurn: TranscriptTurn = {
+      ...live,
+      state: 'completed',
+      steps: [{
+        ...live.steps[0]!,
+        state: 'completed',
+        frames: [{ kind: 'text', frameId: 'cold-answer', role: 'assistant', text: 'ack' }],
+      }],
+    };
+    transcript.apply(healTurnOps(coldTurn, live));
+    const healed = turnOps('t1', transcript.getItems());
+    expect(healed.prompt).toBe(notification);
+    expect(healed.steps[0]!.frames).toHaveLength(1);
+    expect(healed.steps[0]!.frames[0]).toMatchObject({ kind: 'text', role: 'assistant', text: 'ack' });
     binding.dispose();
   });
 
@@ -4498,7 +4670,7 @@ describe('bindSessionTranscript', () => {
       const store = service.forSessionLive('s1')!;
       await service.whenReady('s1');
       expect(store.getAgent('main')!.getItems().length).toBeGreaterThan(0);
-      main.contextMessages = [{ role: 'user', content: [{ type: 'text', text: 'hi' }], toolCalls: [], origin: { kind: 'user' } }];
+      main.contextMessages = [{ role: 'user', content: [{ type: 'text', text: 'hi' }], origin: { kind: 'user' } }];
       main.bus.emit(ev({ type: 'turn.started', turnId: 1, origin: { kind: 'user' }, prompt: 'undone prompt' }));
       const read = vi.spyOn(service, 'readColdSnapshot');
       for (let i = 0; i < failures; i++) read.mockRejectedValueOnce(new Error('temporary read failure'));

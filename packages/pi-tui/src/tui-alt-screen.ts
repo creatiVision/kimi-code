@@ -25,6 +25,7 @@ import {
 	deleteKittyImage,
 	getCapabilities,
 	getKittyImagePlacement,
+	getKittyImagePlacementRows,
 	type ImageProtocol,
 	isImageLine,
 	setCapabilities,
@@ -36,6 +37,7 @@ import {
 	CURSOR_MARKER,
 	compositeTuiLine,
 	dispatchMouseEvent,
+	type LayoutEffect,
 	type OverlayHandle,
 	retargetMouseEvent,
 	TuiBase,
@@ -57,6 +59,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "./utils.ts";
+import { WheelScrollAccelerator, type WheelScrollLines } from "./wheel-scroll.ts";
 
 const ENTER_ALT_SCREEN = "\x1b[?1049h";
 const EXIT_ALT_SCREEN = "\x1b[?1049l";
@@ -77,6 +80,8 @@ const MAX_CACHED_OFFSCREEN_KITTY_IMAGES = 16;
 const MAX_CACHED_OFFSCREEN_KITTY_TRANSMISSION_BYTES = 32 * 1024 * 1024;
 const MAX_CACHED_OFFSCREEN_KITTY_DECODED_BYTES = 64 * 1024 * 1024;
 const DOUBLE_CLICK_INTERVAL_MS = 500;
+const MAX_LAYOUT_EFFECT_PASSES = 10;
+const COPY_ERROR_FLASH_DURATION_MS = 5000;
 // Regular mode delegates double-click selection to the terminal emulator. Fullscreen owns mouse selection,
 // so mirror common terminal word-selection behavior by keeping paths and kebab-case tokens whole.
 const TERMINAL_WORD_SELECTION_JOINERS = new Set(["/", "-"]);
@@ -163,10 +168,15 @@ interface SearchHighlightRange {
 }
 
 export interface TuiAltScreenOptions {
-	/** Number of logical lines moved for each mouse-wheel event. */
-	wheelScrollLines?: number;
+	/**
+	 * Logical lines moved for each mouse-wheel event (default: 1). `"auto"` accelerates fast wheel
+	 * spins on terminals that send one event per notch. Alt+wheel moves five times as far.
+	 */
+	wheelScrollLines?: WheelScrollLines;
 	/** Capture mouse events for viewport scrolling and application-owned text selection. */
 	mouse?: boolean;
+	/** Ignore mouse-button gestures for this long after terminal focus is reported as regained. */
+	refocusMouseGuardMs?: number;
 	/** Style a non-current transcript search match. */
 	searchMatchStyle?: (text: string) => string;
 	/** Style the current transcript search match. */
@@ -185,10 +195,11 @@ export interface TuiAltScreenOptions {
 	/** Automatically copy selected text to the clipboard on mouse release (default: true). */
 	copyOnSelect?: boolean;
 	/**
-	 * Copy selected text to the system clipboard. Return `true` on success; the caller flashes
-	 * an error otherwise. When omitted, the selection is copied via an OSC 52 write.
+	 * Copy selected text to the system clipboard. Return `true` on success, an error message to
+	 * display on failure, or `false` for a generic error. When omitted, the selection is copied
+	 * via an OSC 52 write.
 	 */
-	copySelection?: (text: string) => Promise<boolean>;
+	copySelection?: (text: string) => Promise<boolean | string>;
 }
 
 /** Alternate-screen TUI with a scrollable, application-owned viewport. */
@@ -201,6 +212,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	private previousScreenHeight = 0;
 	private layoutRoot: Component | undefined;
 	private currentLayout: LayoutFrame | undefined;
+	private readonly layoutEffects = new Set<LayoutEffect>();
+	private runningLayoutEffects = false;
+	private layoutEffectRenderRequested = false;
+	private layoutEffectForceRequested = false;
 	private readonly implicitDocument: Component;
 	private readonly implicitScrollView: ScrollView;
 	private readonly flashes: AltScreenFlashContainer;
@@ -234,8 +249,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		x: number;
 		y: number;
 	};
-	private readonly wheelScrollLines: number;
+	private refocusMouseGuardUntil?: number;
+	private readonly wheelScroll: WheelScrollAccelerator;
 	private readonly mouseEnabled: boolean;
+	private readonly refocusMouseGuardMs: number;
 	private readonly searchMatchStyle: (text: string) => string;
 	private readonly searchCurrentMatchStyle: (text: string) => string;
 	private readonly searchNavigationButtonStyle: (text: string, hovered: boolean) => string;
@@ -243,7 +260,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	private readonly openUrl?: (url: string) => void;
 	private readonly onRightClickPaste?: () => void;
 	private copyOnSelect: boolean;
-	private readonly copySelection?: (text: string) => Promise<boolean>;
+	private readonly copySelection?: (text: string) => Promise<boolean | string>;
 
 	constructor(
 		terminal: Terminal,
@@ -261,8 +278,9 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		};
 		this.implicitScrollView = new ScrollView(this.implicitDocument, { follow: "end", primary: true });
 		this.flashes = new AltScreenFlashContainer(() => this.requestRender());
-		this.wheelScrollLines = Math.max(1, Math.floor(options.wheelScrollLines ?? 1));
+		this.wheelScroll = new WheelScrollAccelerator(options.wheelScrollLines ?? 1);
 		this.mouseEnabled = options.mouse ?? true;
+		this.refocusMouseGuardMs = Math.max(0, options.refocusMouseGuardMs ?? 0);
 		this.searchMatchStyle = options.searchMatchStyle ?? ((text) => `\x1b[4m${text}\x1b[24m`);
 		this.searchCurrentMatchStyle = options.searchCurrentMatchStyle ?? ((text) => `\x1b[1;7m${text}\x1b[22;27m`);
 		this.searchNavigationButtonStyle = options.searchNavigationButtonStyle ?? ((text) => text);
@@ -280,6 +298,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 	get isFollowingOutput(): boolean {
 		return this.getPrimaryScrollView().isFollowingEnd;
+	}
+
+	setWheelScrollLines(lines: WheelScrollLines): void {
+		this.wheelScroll.setLines(lines);
 	}
 
 	getCopyOnSelect(): boolean {
@@ -302,6 +324,17 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return this.copyTextToClipboard(text);
 	}
 
+	/** Drop the text selection and multi-click history, e.g. before the host replaces the transcript. */
+	resetTextSelection(): void {
+		this.clearTextSelection();
+		this.lastClick = undefined;
+	}
+
+	/** The lines of the last rendered frame, one per terminal row, as written to the terminal. */
+	getScreenLines(): string[] {
+		return [...this.previousScreen];
+	}
+
 	setLayoutRoot(component: Component | undefined): void {
 		if (this.layoutRoot === component) return;
 		this.layoutRoot = component;
@@ -311,6 +344,22 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 	getLayoutRoot(): Component | undefined {
 		return this.layoutRoot;
+	}
+
+	addLayoutEffect(effect: LayoutEffect): () => void {
+		this.layoutEffects.add(effect);
+		return () => {
+			this.layoutEffects.delete(effect);
+		};
+	}
+
+	override requestRender(force = false): void {
+		if (this.runningLayoutEffects) {
+			if (force) this.layoutEffectForceRequested = true;
+			this.layoutEffectRenderRequested = true;
+			return;
+		}
+		super.requestRender(force);
 	}
 
 	override render(width: number): string[] {
@@ -389,7 +438,9 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			this.terminal.write(`${BEGIN_SYNCHRONIZED_OUTPUT}${EXIT_ALT_SCREEN}\x1b[?25h${END_SYNCHRONIZED_OUTPUT}`);
 		} else {
 			const width = Math.max(1, this.terminal.columns);
-			const documentLines = this.render(width).map((line) => line.replace(OSC133_ZONE_PREFIX, ""));
+			const documentLines = this.resolveFakeCursors(this.render(width)).map((line) =>
+				line.replace(OSC133_ZONE_PREFIX, ""),
+			);
 			this.lastDocument = this.applyLineResets(documentLines.map((line) => line.replaceAll(CURSOR_MARKER, ""))).map(
 				(line) => (isImageLine(line) || visibleWidth(line) <= width ? line : sliceByColumn(line, 0, width, true)),
 			);
@@ -405,6 +456,17 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			setCapabilities(this.savedCapabilities);
 			this.savedCapabilities = undefined;
 		}
+	}
+
+	protected override getExitRestorePrefix(): string {
+		const prefix = super.getExitRestorePrefix();
+		if (!this.altScreenActive) return prefix;
+		return `${END_SYNCHRONIZED_OUTPUT}${this.mouseEnabled ? DISABLE_MOUSE : ""}${ENABLE_AUTOWRAP}${prefix}`;
+	}
+
+	protected override getExitRestoreSuffix(): string {
+		// Kitty keyboard flags are per screen, so the terminal pops them before the alternate screen is left.
+		return `${super.getExitRestoreSuffix()}${this.altScreenActive ? `${EXIT_ALT_SCREEN}\x1b[?25h` : ""}`;
 	}
 
 	private deleteKittyImages(): string {
@@ -572,7 +634,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return true;
 	}
 
-	private refreshSearch(layout: LayoutFrame): boolean {
+	private refreshSearch(
+		layout: LayoutFrame,
+		options: { retainIndex?: boolean; revealSelection?: boolean } = {},
+	): boolean {
 		const search = this.activeSearch;
 		if (!search) return false;
 		const scrollView = layout.primaryScrollView ?? this.implicitScrollView;
@@ -587,17 +652,19 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			return false;
 		}
 
-		const shouldRevealSelection = search.selectionMode !== "retain";
+		const shouldRevealSelection = options.revealSelection || search.selectionMode !== "retain";
 		const result = search.index.search(lines, search.query);
 		const matches = result.matches;
 		search.matches = matches;
-		if (!result.changed && search.selectionMode === "retain") return false;
+		if (!result.changed && search.selectionMode === "retain" && !shouldRevealSelection) return false;
 
-		const exactIndex = result.changed
-			? search.selectedKey
-				? matches.findIndex((match) => getAltScreenSearchMatchKey(match) === search.selectedKey)
-				: -1
-			: search.selectedIndex;
+		// A layout effect can shift rows without changing the selected occurrence.
+		const exactIndex =
+			result.changed && !options.retainIndex
+				? search.selectedKey
+					? matches.findIndex((match) => getAltScreenSearchMatchKey(match) === search.selectedKey)
+					: -1
+				: Math.min(search.selectedIndex, matches.length - 1);
 		let selectedIndex = -1;
 		if (matches.length > 0) {
 			if (search.selectionMode === "query") {
@@ -683,25 +750,32 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			// them too, and the main-screen renderer lets them through.
 			return undefined;
 		}
-		if (data === FOCUS_IN) return undefined;
+		if (data === FOCUS_IN) {
+			if (this.refocusMouseGuardMs > 0) this.refocusMouseGuardUntil = Date.now() + this.refocusMouseGuardMs;
+			return undefined;
+		}
 
 		const wheelEvent = this.parseWheelEvent(data);
 		if (wheelEvent) {
-			const event = this.createMouseEvent("wheel", wheelEvent.button, wheelEvent.x, wheelEvent.y, {
-				wheelDelta: wheelEvent.direction * this.getWheelScrollLines(wheelEvent.button),
-			});
+			const lines = this.wheelScroll.next(wheelEvent.direction, performance.now());
+			// SGR mouse button codes use bit 3 (value 8) for the Alt modifier.
+			const wheelDelta =
+				wheelEvent.direction * ((wheelEvent.button & 8) !== 0 ? lines * ALT_WHEEL_SCROLL_MULTIPLIER : lines);
+			const event = this.createMouseEvent("wheel", wheelEvent.button, wheelEvent.x, wheelEvent.y, { wheelDelta });
 			const overlay = this.dispatchMouseToOverlay(event);
 			const result = overlay.result ?? (overlay.hit ? undefined : this.dispatchMouseToLayout(event));
 			if (result) {
 				if (this.applyMouseDispatchResult(event, result)) this.requestRender();
 				return { consume: true };
 			}
-			if (this.shouldDeferViewportInputToOverlay()) return undefined;
-			this.routeWheel(wheelEvent);
+			this.routeWheel(wheelEvent, wheelDelta);
 			return { consume: true };
 		}
 		const mouseEvent = this.parseSgrMouseEvent(data);
 		if (mouseEvent) {
+			if (this.refocusMouseGuardUntil !== undefined && Date.now() < this.refocusMouseGuardUntil) {
+				return { consume: true };
+			}
 			this.handleMouseEvent(mouseEvent);
 			return { consume: true };
 		}
@@ -978,13 +1052,8 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return undefined;
 	}
 
-	private getWheelScrollLines(button: number): number {
-		// SGR mouse button codes use bit 3 (value 8) for the Alt modifier.
-		return (button & 8) !== 0 ? this.wheelScrollLines * ALT_WHEEL_SCROLL_MULTIPLIER : this.wheelScrollLines;
-	}
-
-	private routeWheel(event: WheelEvent): void {
-		let remaining = event.direction * this.getWheelScrollLines(event.button);
+	private routeWheel(event: WheelEvent, delta: number): void {
+		let remaining = delta;
 		const seen = new Set<ScrollView>();
 		for (const scrollView of this.currentLayout ? getScrollViewsAt(this.currentLayout, event.x, event.y) : []) {
 			seen.add(scrollView);
@@ -1429,6 +1498,31 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return { start: Math.max(minColumn, start), end: Math.min(maxColumn, end) };
 	}
 
+	private preserveSelectionAcrossPadding(before: LayoutFrame, after: LayoutFrame): void {
+		const scrollView = this.selectionAnchor?.scrollView;
+		if (!scrollView) return;
+		const oldLines = getScrollViewBox(before, scrollView)?.scrollContentLines;
+		const newLines = getScrollViewBox(after, scrollView)?.scrollContentLines;
+		if (!oldLines || !newLines || oldLines.length === newLines.length) return;
+		const delta = newLines.length - oldLines.length;
+		const longer = delta > 0 ? newLines : oldLines;
+		const shorter = delta > 0 ? oldLines : newLines;
+		const padding = Math.abs(delta);
+		if (!longer.slice(0, padding).every((line) => line === "")) return;
+		if (!shorter.every((line, row) => line === longer[row + padding])) return;
+		// Word/line selections can share their endpoints with the initial range.
+		const points = new Set([
+			this.selectionAnchor,
+			this.selectionFocus,
+			this.selectionInitialRange?.start,
+			this.selectionInitialRange?.end,
+		]);
+		for (const point of points) {
+			if (point?.scrollView === scrollView) point.row = Math.max(0, point.row + delta);
+		}
+		if (this.lastClick?.scrollView === scrollView) this.lastClick.row = Math.max(0, this.lastClick.row + delta);
+	}
+
 	private getActiveSelectionText(): string | undefined {
 		const selection = this.getSelectionBounds();
 		if (!selection) return undefined;
@@ -1465,8 +1559,12 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		// "Copied!" while leaving the system clipboard untouched (e.g. macOS Terminal.app, tmux
 		// without OSC 52 clipboard passthrough), so only report success when it actually copies.
 		if (this.copySelection) {
-			const ok = await this.copySelection(text);
-			this.flash(ok ? "Copied!" : "Copy failed");
+			const result = await this.copySelection(text);
+			const ok = result === true;
+			this.flash(
+				ok ? "Copied!" : typeof result === "string" ? result : "Copy failed",
+				ok ? undefined : COPY_ERROR_FLASH_DURATION_MS,
+			);
 			return ok;
 		}
 		this.terminal.write(`\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`);
@@ -1637,11 +1735,14 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		const row = clip.y + clip.height - 1;
 		if (row >= screen.length || isImageLine(screen[row] ?? "")) return screen;
 		const scrollbarColumn = box ? getScrollbarGeometry(box)?.column : undefined;
-		const availableWidth = Math.max(0, (scrollbarColumn ?? clip.x + clip.width) - clip.x);
-		const text = truncateToWidth(this.scrollToEndIndicator(), availableWidth, "");
+		const label = truncateToWidth(this.scrollToEndIndicator(), clip.width, "");
+		const labelWidth = visibleWidth(label);
+		const column = clip.x + Math.floor((clip.width - labelWidth) / 2);
+		const rightEdge = scrollbarColumn ?? clip.x + clip.width;
+		const availableWidth = Math.max(0, rightEdge - column);
+		const text = truncateToWidth(label, availableWidth, "");
 		const textWidth = visibleWidth(text);
 		if (textWidth === 0) return screen;
-		const column = clip.x + Math.floor((availableWidth - textWidth) / 2);
 		const result = [...screen];
 		result[row] = compositeTuiLine(result[row] ?? "", text, column, textWidth, width);
 		this.scrollToEndIndicatorRect = { row, column, width: textWidth };
@@ -1666,12 +1767,37 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		if (this.stopped || !this.altScreenActive) return;
 		const width = Math.max(1, this.terminal.columns);
 		const height = Math.max(1, this.terminal.rows);
-		const root = this.layoutRoot ?? this.implicitScrollView;
-		let nextLayout = renderLayoutFrame(root, width, height, () => this.requestRender());
-		if (this.refreshSearch(nextLayout)) {
+		const revealSelection = this.activeSearch !== undefined && this.activeSearch.selectionMode !== "retain";
+		let nextLayout: LayoutFrame;
+		let previousPass: LayoutFrame | undefined;
+		for (let pass = 0; ; pass++) {
+			const root = this.layoutRoot ?? this.implicitScrollView;
 			nextLayout = renderLayoutFrame(root, width, height, () => this.requestRender());
+			if (this.refreshSearch(nextLayout, { retainIndex: pass > 0, revealSelection })) {
+				nextLayout = renderLayoutFrame(root, width, height, () => this.requestRender());
+			}
+			if (previousPass) this.preserveSelectionAcrossPadding(previousPass, nextLayout);
+			if (this.layoutEffects.size === 0) break;
+			this.currentLayout = nextLayout;
+			this.layoutEffectRenderRequested = false;
+			this.layoutEffectForceRequested = false;
+			this.runningLayoutEffects = true;
+			try {
+				for (const effect of [...this.layoutEffects]) {
+					if (this.layoutEffects.has(effect)) effect();
+				}
+			} finally {
+				this.runningLayoutEffects = false;
+			}
+			if (!this.layoutEffectRenderRequested) break;
+			previousPass = nextLayout;
+			if (this.layoutEffectForceRequested) this.resetRenderState();
+			if (pass + 1 >= MAX_LAYOUT_EFFECT_PASSES) {
+				throw new Error(`Layout effects did not stabilize after ${MAX_LAYOUT_EFFECT_PASSES} passes`);
+			}
 		}
-		let screen = nextLayout.lines.map((line) => line.replace(OSC133_ZONE_PREFIX, ""));
+		// Resolve fake cursors before highlighting and compositing, which only track SGR codes
+		let screen = this.resolveFakeCursors(nextLayout.lines.map((line) => line.replace(OSC133_ZONE_PREFIX, "")));
 		screen = this.applySearchHighlights(screen, nextLayout);
 		screen = this.compositeScrollToEndIndicator(screen, nextLayout, width);
 		screen = this.compositeOverlays(screen, width, height);
@@ -1687,10 +1813,25 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 		const fullRedraw =
 			this.previousScreen.length === 0 || this.previousScreenWidth !== width || this.previousScreenHeight !== height;
-		const imagesNeedRedraw = screen.some(
-			(line, row) =>
-				line !== this.previousScreen[row] && (isImageLine(line) || isImageLine(this.previousScreen[row] ?? "")),
+		const changedRows = screen.map((line, row) => line !== this.previousScreen[row]);
+		const imageAnchorsNeedRedraw = screen.some(
+			(line, row) => changedRows[row] && (isImageLine(line) || isImageLine(this.previousScreen[row] ?? "")),
 		);
+		const isWezTerm = Boolean(process.env['WEZTERM_PANE']) || process.env['TERM_PROGRAM']?.toLowerCase() === "wezterm";
+		const imageCellsNeedRedraw =
+			!imageAnchorsNeedRedraw &&
+			isWezTerm &&
+			this.imageProtocol === "kitty" &&
+			changedRows.some(Boolean) &&
+			screen.some((line, row) => {
+				const placementRows = getKittyImagePlacementRows(line);
+				if (placementRows === undefined) return false;
+				for (let coveredRow = row; coveredRow < row + placementRows; coveredRow++) {
+					if (changedRows[coveredRow]) return true;
+				}
+				return false;
+			});
+		const imagesNeedRedraw = imageAnchorsNeedRedraw || imageCellsNeedRedraw;
 		const redrawImages = fullRedraw || imagesNeedRedraw;
 		const hadUploadedKittyImages = this.uploadedKittyImages.size > 0;
 		const preparedKittyScreen =
@@ -1712,9 +1853,31 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		}
 		buffer += preparedKittyScreen.evictedImageDeletion;
 
-		for (let row = 0; row < height; row++) {
-			if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row]) continue;
-			buffer += `\x1b[${row + 1};1H\x1b[2K${preparedKittyScreen.lines[row] ?? ""}`;
+		// WezTerm erases intersecting Kitty image cells when a later row write touches a covered row.
+		// Draw image placements after every clear and text write so nothing later intersects them; preserve
+		// the existing interleaved output for text-only frames and every other terminal.
+		const drawKittyImagesLast =
+			redrawImages && this.imageProtocol === "kitty" && screen.some(isImageLine) && isWezTerm;
+		if (drawKittyImagesLast) {
+			for (let row = 0; row < height; row++) {
+				if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row]) continue;
+				buffer += `\x1b[${row + 1};1H\x1b[2K`;
+			}
+			for (let row = 0; row < height; row++) {
+				if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row]) continue;
+				if (isImageLine(preparedKittyScreen.lines[row] ?? "")) continue;
+				buffer += `\x1b[${row + 1};1H${preparedKittyScreen.lines[row] ?? ""}`;
+			}
+			for (let row = 0; row < height; row++) {
+				if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row]) continue;
+				if (!isImageLine(preparedKittyScreen.lines[row] ?? "")) continue;
+				buffer += `\x1b[${row + 1};1H${preparedKittyScreen.lines[row] ?? ""}`;
+			}
+		} else {
+			for (let row = 0; row < height; row++) {
+				if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row]) continue;
+				buffer += `\x1b[${row + 1};1H\x1b[2K${preparedKittyScreen.lines[row] ?? ""}`;
+			}
 		}
 
 		if (cursorPos) {

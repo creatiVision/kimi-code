@@ -6,15 +6,15 @@ import {
 } from 'openai';
 import { describe, expect, it, vi } from 'vitest';
 
-import { UNKNOWN_CAPABILITY } from '#/llm/capability';
-import { createAssistantMessage, createUserMessage, type Message } from '#/llm/message';
-import type { LlmModel } from '#/llm/model';
-import { classifyKimiQuotaError } from '#/llm-kimi/errors';
-import { kimiConnection, kimiOpenAITrait } from '#/llm-kimi/trait';
-import { createGoogleGenAIRequester } from '#/llm/requester/bases/google-genai/requester';
-import { convertOpenAIError } from '#/llm/requester/bases/openai/format';
-import { createOpenAIRequester } from '#/llm/requester/bases/openai/requester';
-import type { LlmRequester, LlmRequestEvent } from '#/llm/requester/requester';
+import { UNKNOWN_CAPABILITY } from '#/llm-requester/capability';
+import { createAssistantMessage, createUserMessage, type Message } from '#/message';
+import type { LlmModel } from '#/llm-requester/model';
+import { classifyKimiQuotaError } from '#/llm/builtin/provider/kimi/errors';
+import { createKimiOpenAIRequester, kimiEndpoint } from '#/llm-requester/factories';
+import { createGoogleGenAIRequester } from '#/llm-requester/factories';
+import { convertOpenAIError } from '#/llm/builtin/protocol/openai/decode';
+import { createOpenAIRequester } from '#/llm-requester/factories';
+import type { LlmRequester, LlmRequestEvent } from '#/llm-requester/requester';
 
 const model: LlmModel = {
   provider: 'test',
@@ -87,17 +87,17 @@ describe('convertOpenAIError', () => {
     expect(convertOpenAIError(raw)).toMatchObject({ kind: 'context_overflow', statusCode: 400 });
   });
 
-  it('maps 413 too-large messages to request_too_large', () => {
-    const raw = new RawOpenAISDKAPIError(
+  it('maps remaining status errors to their kinds', () => {
+    const tooLarge = new RawOpenAISDKAPIError(
       413,
       { message: 'request entity too large' },
       undefined,
       new Headers(),
     );
-    expect(convertOpenAIError(raw)).toMatchObject({ kind: 'request_too_large', statusCode: 413 });
-  });
-
-  it('maps remaining status errors to their kinds', () => {
+    expect(convertOpenAIError(tooLarge)).toMatchObject({
+      kind: 'request_too_large',
+      statusCode: 413,
+    });
     const overloaded = new RawOpenAISDKAPIError(529, {}, 'overloaded', new Headers());
     expect(convertOpenAIError(overloaded)).toMatchObject({ kind: 'overloaded', statusCode: 529 });
     const generic = new RawOpenAISDKAPIError(500, {}, 'server error', new Headers());
@@ -291,9 +291,8 @@ describe('requester error conversion', () => {
   });
 
   it('converts a kimi quota response to quota_exhausted', async () => {
-    const requester = createOpenAIRequester({
-      connection: kimiConnection,
-      trait: kimiOpenAITrait,
+    const requester = createKimiOpenAIRequester({
+      endpoint: kimiEndpoint,
       classifyError: classifyKimiQuotaError,
       clientFactory: failingOpenAIClient(
         new RawOpenAISDKAPIError(

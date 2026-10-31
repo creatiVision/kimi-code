@@ -30,7 +30,7 @@ This is a pnpm monorepo. The most relevant entry points are:
 - `apps/vis` — session debug visualizer
 - `packages/node-sdk` — public TypeScript SDK (`@moonshot-ai/kimi-code-sdk`)
 - `packages/agent-core-v2` — the agent engine (v2, DI Scope architecture); `packages/agent-core` is v1 and being phased out
-- `packages/klient`, `kap-server`, `protocol`, `transcript`, `kosong`, `kaos`, `oauth`, `telemetry` — internal engine packages
+- `packages/klient`, `kap-server`, `protocol`, `transcript`, `kosong`, `oauth`, `telemetry` — internal engine packages
 - `docs/` — VitePress bilingual docs site
 
 For the full project map, see [AGENTS.md](AGENTS.md).
@@ -92,6 +92,11 @@ Every PR opens with the [PR template](.github/pull_request_template.md). PR titl
 - Linting via `oxlint` (config in `.oxlintrc.json`).
 - Auto-formatting via `pnpm lint:fix`.
 - Follow existing local patterns when the lint rules do not cover a style choice.
+
+## Engine Invariants
+
+- Two filesystems exist side by side and must not be conflated. Anything workspace-related (project files, project config such as `AGENTS.md` and `.kimi-code/`, skill and instruction discovery, file the model can be told to read) always goes through the session's `environment.fs` — acquire it from the calling agent's environment lease, never from a node-local backend. The App-level `IHostFileSystem` is reserved for server-local data only: session storage, the search index, and the blob store.
+- The same split applies to processes: workspace commands run through the environment's process service; App-level process backends are for host-local jobs (hooks, local MCP servers, server maintenance).
 
 ## Reporting Security Issues
 
