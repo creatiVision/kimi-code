@@ -16,12 +16,15 @@ import type {
   AgentCommandInfo,
   AgentEnvironmentBinding,
   BackgroundTaskInfo,
+  CapabilityInstallOptions,
   CapabilityStatus,
   CompactOptions,
   CreateGoalInput,
+  EditGoalObjectiveInput,
   GetCronTasksResult,
   GoalSnapshot,
   GoalToolResult,
+  InstallPluginInput,
   JsonObject,
   McpServerConfig,
   McpServerInfo,
@@ -31,6 +34,7 @@ import type {
   PluginSummary,
   PromptInput,
   PromptSkillActivation,
+  PromptSubmissionResult,
   ReloadSessionOptions,
   ReloadSummary,
   ResumedSessionState,
@@ -69,7 +73,7 @@ export interface SessionOptions {
 interface CapabilityRpcSurface {
   listCapabilities(): Promise<readonly CapabilityStatus[]>;
   getCapability(id: string): Promise<CapabilityStatus>;
-  installCapability(id: string): Promise<CapabilityStatus>;
+  installCapability(id: string, options?: CapabilityInstallOptions): Promise<CapabilityStatus>;
 }
 
 export function capabilityRpc(rpc: SDKRpcClientBase): CapabilityRpcSurface {
@@ -178,9 +182,9 @@ export class Session {
     input: string | PromptInput,
     skills: readonly PromptSkillActivation[],
     options?: { readonly steerIfActive?: boolean },
-  ): Promise<void> {
+  ): Promise<PromptSubmissionResult> {
     this.ensureOpen();
-    await this.rpc.promptWithSkills({
+    return this.rpc.promptWithSkills({
       sessionId: this.id,
       input: normalizePromptInput(input),
       skills,
@@ -209,9 +213,9 @@ export class Session {
     return this.rpc.cancelShellCommand({ sessionId: this.id, commandId });
   }
 
-  async steer(input: string | PromptInput): Promise<void> {
+  async steer(input: string | PromptInput): Promise<PromptSubmissionResult> {
     this.ensureOpen();
-    await this.rpc.steer({
+    return this.rpc.steer({
       sessionId: this.id,
       input: normalizePromptInput(input),
     });
@@ -609,6 +613,11 @@ export class Session {
     return this.rpc.getGoal({ sessionId: this.id });
   }
 
+  async editGoalObjective(input: EditGoalObjectiveInput): Promise<GoalSnapshot> {
+    this.ensureOpen();
+    return this.rpc.editGoalObjective({ sessionId: this.id, ...input });
+  }
+
   async pauseGoal(): Promise<GoalSnapshot> {
     this.ensureOpen();
     return this.rpc.pauseGoal({ sessionId: this.id });
@@ -678,9 +687,9 @@ export class Session {
     return this.rpc.listPlugins();
   }
 
-  async installPlugin(source: string): Promise<PluginSummary> {
+  async installPlugin(input: string | InstallPluginInput): Promise<PluginSummary> {
     this.ensureOpen();
-    return this.rpc.installPlugin(source);
+    return this.rpc.installPlugin(input);
   }
 
   async setPluginEnabled(id: string, enabled: boolean): Promise<void> {
@@ -704,9 +713,9 @@ export class Session {
    * Start an idempotent capability install (binary runtime + wiring) in the
    * background; poll `getCapability` for progress.
    */
-  async installCapability(id: string): Promise<CapabilityStatus> {
+  async installCapability(id: string, options?: CapabilityInstallOptions): Promise<CapabilityStatus> {
     this.ensureOpen();
-    return capabilityRpc(this.rpc).installCapability(id);
+    return capabilityRpc(this.rpc).installCapability(id, options);
   }
 
   async setPluginMcpServerEnabled(

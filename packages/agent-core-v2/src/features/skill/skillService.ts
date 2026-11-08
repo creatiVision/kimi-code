@@ -98,6 +98,7 @@ export class AgentSkillService implements IAgentSkillService {
         clientMetadata: input.clientMetadata,
       },
       content,
+      input.promptId,
     );
     if (turn === undefined) {
       throw new Error2(
@@ -160,6 +161,7 @@ export class AgentSkillService implements IAgentSkillService {
           content: [...prepared.map((activation) => activation.part), ...input.input],
         },
         meta: {
+          promptId: input.promptId,
           origin: {
             kind: 'user',
             skillActivations: prepared.map((activation) => activation.entry),
@@ -173,7 +175,7 @@ export class AgentSkillService implements IAgentSkillService {
     );
     const handle = this.loop.promptHandle(id)!;
     if (!steerable && (status.state === 'running' || status.paused || status.queue.length > 0)) {
-      return { prompt_id: id, created_at: handle.createdAt, state: 'queued' };
+      return { prompt_id: id, created_at: handle.createdAt, state: 'queued', steered: false };
     }
     await Promise.race([handle.launched, handle.completion]);
     const turn = await handle.launched;
@@ -186,6 +188,7 @@ export class AgentSkillService implements IAgentSkillService {
       prompt_id: id,
       created_at: handle.createdAt,
       state: handle.state === 'blocked' ? 'blocked' : 'running',
+      steered: steerable && turn?.id === status.activeTurnId,
     };
   }
 
@@ -249,6 +252,7 @@ export class AgentSkillService implements IAgentSkillService {
   private async recordActivation(
     origin: SkillActivationOrigin,
     input?: readonly ContentPart[],
+    promptId?: string,
   ): Promise<Turn | undefined> {
     await this.dispatcher.dispatch(
       new SkillActivated({
@@ -268,7 +272,7 @@ export class AgentSkillService implements IAgentSkillService {
     const { id } = this.loop.submit(
       {
         message: { role: 'user', content: [...input] },
-        meta: { origin, tracked: !steer },
+        meta: { promptId, origin, tracked: !steer },
       },
       { steerIfActive: steer },
     );

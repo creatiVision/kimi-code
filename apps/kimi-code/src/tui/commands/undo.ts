@@ -115,7 +115,6 @@ async function undoByCount(host: SlashCommandHost, count: number): Promise<boole
     host.showError(`Failed to undo: ${message}`);
     return false;
   }
-  host.noteContextCut?.();
 
   const children = host.state.transcriptContainer.children;
   const lastUserComponentIndex = findUndoAnchorComponentIndex(children, count);
@@ -136,7 +135,7 @@ async function undoByCount(host: SlashCommandHost, count: number): Promise<boole
       if (entry?.hookResult === true) continue;
       break;
     }
-    removeUndoContextComponents(children, lastUserComponentIndex, groupChildIndices);
+    removeUndoContextComponents(host, children, lastUserComponentIndex, groupChildIndices);
   }
 
   const groupEntryIndices = new Set<number>();
@@ -489,7 +488,8 @@ function findUndoAnchorComponentIndex(
 }
 
 function removeUndoContextComponents(
-  children: Component[],
+  host: SlashCommandHost,
+  children: readonly Component[],
   startIndex: number,
   additionalIndices: ReadonlySet<number>,
 ): void {
@@ -500,7 +500,7 @@ function removeUndoContextComponents(
       (i >= startIndex || additionalIndices.has(i)) &&
       isUndoContextComponent(child)
     ) {
-      children.splice(i, 1);
+      host.state.transcriptContainer.removeChild(child);
     }
   }
 }

@@ -1,9 +1,8 @@
 import {
   ErrorCodes,
   IAgentChangeNotifierService,
-  IAgentContextMemoryService,
+  IAgentGoalService,
   IAgentProfileService,
-  IAgentConversationUndoService,
   IAgentFullCompactionService,
   IAgentLifecycleService,
   IAgentLoopService,
@@ -26,6 +25,7 @@ import {
   IWorkspaceInstanceManager,
   IWorkspaceService,
   closeSessionById,
+  ensureMainAgent as ensureMainAgentContext,
   getLiveSessionById,
   programForSession,
   resolveSubagentModelPool,
@@ -33,7 +33,6 @@ import {
   resumeSessionById,
   setSessionArchived,
   Error2,
-  type ContextMessage,
   type IAgentScopeHandle,
   type ISessionScopeHandle,
   type Scope,
@@ -44,7 +43,8 @@ import { ISessionLockService } from '@moonshot-ai/agent-core-v2/persistence/inte
 import { SessionMetaUpdated } from '@moonshot-ai/agent-core-v2/session/sessionMetadata/sessionMetaEvents';
 import { ErrorCode } from '../protocol/error-codes';
 import { pageResponseSchema } from '../protocol/pagination';
-import { toProtocolMessage } from '../services/messages/messageProjection';
+import type { ConversationService } from '../services/conversation/conversationService';
+import { loadWorkspaceVisibility } from '../services/workspaceVisibility';
 import {
   archiveSessionResponseSchema,
   compactSessionRequestSchema,
@@ -53,10 +53,11 @@ import {
   createSessionRequestSchema,
   deleteSessionResponseSchema,
   forkSessionRequestSchema,
+  editSessionGoalRequestSchema,
+  editSessionGoalResponseSchema,
   getSessionGoalResponseSchema,
   listSessionChildrenResponseSchema,
   sessionAbortResponseSchema,
-  sessionStatusResponseSchema,
   sessionWarningsResponseSchema,
   startBtwSessionResponseSchema,
   takeoverSessionResponseSchema,
@@ -101,6 +102,14 @@ interface SessionRouteHost {
     options: { preHandler: unknown[]; schema?: Record<string, unknown> } | undefined,
     handler: (
       req: { id: string; query: unknown; params: unknown },
+      reply: { send(payload: unknown): unknown },
+    ) => Promise<void> | void,
+  ): unknown;
+  patch(
+    path: string,
+    options: { preHandler: unknown[]; schema?: Record<string, unknown> },
+    handler: (
+      req: { id: string; body: unknown; params: unknown; headers: Record<string, unknown> },
       reply: { send(payload: unknown): unknown },
     ) => Promise<void> | void,
   ): unknown;
@@ -175,15 +184,16 @@ const sessionActionRequestSchema = z.preprocess(
   z.object({
     title: z.string().min(1).optional(),
     metadata: z.record(z.string(), z.unknown()).optional(),
+    turn_index: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
     instruction: z.string().optional(),
-    count: z.number().int().positive().optional(),
-    page_size: z.number().int().min(1).max(100).optional(),
+    turn_id: z.string().min(1).optional(),
+    agent_id: z.string().min(1).optional(),
   }),
 );
 
 const detailsSchema = z.array(z.object({ path: z.string(), message: z.string() }));
 
-export function registerSessionsRoutes(app: SessionRouteHost, core: Scope): void {
+export function registerSessionsRoutes(app: SessionRouteHost, core: Scope, conversations: ConversationService): void {
   const createRoute = defineRoute(
     {
       method: 'POST',
@@ -302,8 +312,7 @@ export function registerSessionsRoutes(app: SessionRouteHost, core: Scope): void
       const raw = req.query;
       const archivedOnly = raw.archived_only === true;
 
-      const workspaces = await core.accessor.get(IWorkspaceService).list();
-      const roots = new Map(workspaces.map((w) => [w.id, w.root]));
+      const { roots, visibleWorkspaceIds } = await loadWorkspaceVisibility(core);
 
       if (raw.workspace_id !== undefined && !roots.has(raw.workspace_id)) {
         reply.send(
@@ -350,6 +359,7 @@ export function registerSessionsRoutes(app: SessionRouteHost, core: Scope): void
           if (page.items.length === 0) break;
           let exhausted = false;
           for (const summary of page.items) {
+            if (!visibleWorkspaceIds.has(summary.workspaceId)) continue;
             if (!newerThanCursor(summary)) {
               exhausted = true;
               break;
@@ -381,6 +391,7 @@ export function registerSessionsRoutes(app: SessionRouteHost, core: Scope): void
         });
         const eligible: Eligible[] = [];
         for (const summary of page.items) {
+          if (!visibleWorkspaceIds.has(summary.workspaceId)) continue;
           const cwd = summary.cwd ?? roots.get(summary.workspaceId);
           if (cwd === undefined) continue;
           if (raw.exclude_empty === true && (summary.lastPrompt ?? '').length === 0) continue;
@@ -634,6 +645,7 @@ export function registerSessionsRoutes(app: SessionRouteHost, core: Scope): void
         ...sessionConflictErrors,
         [ErrorCode.COMPACTION_UNABLE]: {},
         [ErrorCode.SESSION_UNDO_UNAVAILABLE]: {},
+        [ErrorCode.TURN_NOT_FOUND]: {},
       },
       description: 'Run a session action',
       tags: ['sessions'],
@@ -645,7 +657,7 @@ export function registerSessionsRoutes(app: SessionRouteHost, core: Scope): void
           tail: req.params.tail,
           actions: sessionActions,
           resourceLabel: 'session',
-          extra: { core, req, reply },
+          extra: { core, conversations, req, reply },
           body: req.body,
           onUnsupported: (message) => {
             reply.send(buildValidationEnvelope([{ path: 'session_id', message }], req.id));
@@ -773,35 +785,6 @@ export function registerSessionsRoutes(app: SessionRouteHost, core: Scope): void
     createChildRoute.handler as Parameters<SessionRouteHost['post']>[2],
   );
 
-  const statusRoute = defineRoute(
-    {
-      method: 'GET',
-      path: '/sessions/{session_id}/status',
-      params: sessionIdParamSchema,
-      success: { data: sessionStatusResponseSchema },
-      errors: {
-        [ErrorCode.VALIDATION_FAILED]: { detailsSchema },
-        [ErrorCode.SESSION_NOT_FOUND]: {},
-      },
-      description: 'Get realtime session status (best-effort in this slice)',
-      tags: ['sessions'],
-    },
-    async (req, reply) => {
-      try {
-        const { session_id } = req.params;
-        const status = await core.accessor.get(ISessionLegacyService).status(session_id);
-        reply.send(okEnvelope(status, req.id));
-      } catch (error) {
-        sendMappedError(reply, req, error);
-      }
-    },
-  );
-  app.get(
-    statusRoute.path,
-    statusRoute.options,
-    statusRoute.handler as Parameters<SessionRouteHost['get']>[2],
-  );
-
   const goalRoute = defineRoute(
     {
       method: 'GET',
@@ -811,6 +794,7 @@ export function registerSessionsRoutes(app: SessionRouteHost, core: Scope): void
       errors: {
         [ErrorCode.VALIDATION_FAILED]: { detailsSchema },
         [ErrorCode.SESSION_NOT_FOUND]: {},
+        [ErrorCode.WIRE_VERSION_TOO_LOW]: {},
       },
       description: 'Get the current session goal (null when none is active)',
       tags: ['sessions'],
@@ -831,6 +815,51 @@ export function registerSessionsRoutes(app: SessionRouteHost, core: Scope): void
     goalRoute.handler as Parameters<SessionRouteHost['get']>[2],
   );
 
+  const editGoalRoute = defineRoute(
+    {
+      method: 'PATCH',
+      path: '/sessions/{session_id}/goal',
+      params: sessionIdParamSchema,
+      body: editSessionGoalRequestSchema,
+      success: { data: editSessionGoalResponseSchema },
+      errors: {
+        [ErrorCode.VALIDATION_FAILED]: { detailsSchema },
+        [ErrorCode.SESSION_NOT_FOUND]: {},
+        [ErrorCode.GOAL_NOT_FOUND]: {},
+        [ErrorCode.GOAL_STATUS_INVALID]: {},
+        [ErrorCode.GOAL_OBJECTIVE_EMPTY]: {},
+        [ErrorCode.GOAL_OBJECTIVE_TOO_LONG]: {},
+      },
+      description: 'Edit the objective of the current session goal in place',
+      tags: ['sessions'],
+    },
+    async (req, reply) => {
+      try {
+        const { session_id } = req.params;
+        const session = await resumeSessionById(core.accessor, session_id);
+        if (session === undefined) {
+          throw new Error2(ErrorCodes.SESSION_NOT_FOUND, `session ${session_id} does not exist`);
+        }
+        const { agentId } = await ensureMainAgentContext(session);
+        const agent = session.accessor.get(IAgentLifecycleService).handleOf(agentId);
+        if (agent === undefined) {
+          throw new Error2(ErrorCodes.AGENT_NOT_FOUND, 'Main agent was not found');
+        }
+        const goal = await agent.accessor
+          .get(IAgentGoalService)
+          .editGoalObjective({ objective: req.body.objective });
+        reply.send(okEnvelope(goal, req.id));
+      } catch (error) {
+        sendMappedError(reply, req, error);
+      }
+    },
+  );
+  app.patch(
+    editGoalRoute.path,
+    editGoalRoute.options,
+    editGoalRoute.handler as Parameters<SessionRouteHost['patch']>[2],
+  );
+
   const sessionWarningsRoute = defineRoute(
     {
       method: 'GET',
@@ -840,6 +869,7 @@ export function registerSessionsRoutes(app: SessionRouteHost, core: Scope): void
       errors: {
         [ErrorCode.VALIDATION_FAILED]: { detailsSchema },
         [ErrorCode.SESSION_NOT_FOUND]: {},
+        [ErrorCode.WIRE_VERSION_TOO_LOW]: {},
       },
       description: 'Get session-level warnings (e.g. oversized AGENTS.md)',
       tags: ['sessions'],
@@ -893,6 +923,7 @@ type SessionAction =
 
 interface SessionActionExtra {
   readonly core: Scope;
+  readonly conversations: ConversationService;
   readonly req: { readonly id: string };
   readonly reply: { readonly send: (payload: unknown) => unknown };
 }
@@ -928,6 +959,7 @@ async function forkSessionAction(
       sourceSessionId: id,
       title: body.title,
       metadata: body.metadata,
+      turnIndex: body.turn_index,
     });
     const session = toWireSession(
       { ...meta, workspaceId: lease.instance.program.workspaceId },
@@ -964,30 +996,15 @@ async function compactSessionAction(
 async function undoSessionAction(
   ctx: SessionActionCtx<z.infer<typeof undoSessionRequestSchema>>,
 ): Promise<void> {
-  const { core, req, reply, id, body } = ctx;
-  const agent = await resolveMainAgent(core, id);
-  await reloadOnStale(
+  const { core, conversations, req, reply, id, body } = ctx;
+  const removed = await reloadOnStale(
     core.accessor,
     id,
-    () => agent.accessor.get(IAgentConversationUndoService).undo(body.count),
+    async () => (await conversations.feed(id, body.agent_id ?? MAIN_AGENT_ID)).undo(body.turn_id),
     { retry: false },
   );
-  const history = agent.accessor.get(IAgentContextMemoryService).get();
   requestLog(req)?.info({ session_id: id, action: 'undo' }, 'session action completed');
-  const legacy = core.accessor.get(ISessionLegacyService);
-  const [summary, status] = await Promise.all([
-    core.accessor.get(ISessionIndex).get(id),
-    legacy.status(id),
-  ]);
-  reply.send(
-    okEnvelope(
-      {
-        messages: pageUndoMessages(id, summary?.createdAt ?? 0, history, body.page_size),
-        status,
-      },
-      req.id,
-    ),
-  );
+  reply.send(okEnvelope({ removed_turn_ids: removed }, req.id));
 }
 
 async function abortSessionAction(ctx: SessionActionCtx): Promise<void> {
@@ -1256,29 +1273,6 @@ function normalizeOptional(value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
   const trimmed = value.trim();
   return trimmed.length === 0 ? undefined : trimmed;
-}
-
-const DEFAULT_UNDO_MESSAGE_PAGE_SIZE = 50;
-const MAX_UNDO_MESSAGE_PAGE_SIZE = 100;
-
-function pageUndoMessages(
-  sessionId: string,
-  sessionCreatedAtMs: number,
-  history: readonly ContextMessage[],
-  requestedPageSize: number | undefined,
-): { items: ReturnType<typeof toProtocolMessage>[]; has_more: boolean } {
-  const pageSize = Math.min(
-    Math.max(requestedPageSize ?? DEFAULT_UNDO_MESSAGE_PAGE_SIZE, 1),
-    MAX_UNDO_MESSAGE_PAGE_SIZE,
-  );
-  const all = history.map((message, index) =>
-    toProtocolMessage(sessionId, index, message, sessionCreatedAtMs),
-  );
-  const desc = all.toReversed();
-  return {
-    items: desc.slice(0, pageSize),
-    has_more: desc.length > pageSize,
-  };
 }
 
 function buildWireMetadata(

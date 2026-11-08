@@ -17,8 +17,6 @@ import type { LlmEvent } from '#/llm-requester/actor';
 import type { LlmRequester, LlmRequestEvent } from '#/llm-requester/requester';
 import type { LlmRetryOptions } from '#/llm-requester/retry';
 import { emptyUsage, type TokenUsage } from '#/llm-requester/usage';
-import { connectPlugins } from '#/plugin';
-import { createTimingPlugin } from '#/timing/plugin';
 import { createAgentMachine, type AgentEmitted, type AgentMachineSelf, type PromptGateVerdict, type ScopeFactoryOutput } from '#/agent/machine';
 import type { UserPromptOrigin } from '#/agent/origin';
 import { estimateMessageTokens, estimateTextTokens } from '#/agent/context-usage';
@@ -415,6 +413,7 @@ describe('agent machine tool failure', () => {
               requestId: null,
               retryAfterMs: null,
               headers: null,
+              retryable: true,
             },
           });
           return Promise.resolve();
@@ -863,7 +862,10 @@ describe('agent machine lifecycle', () => {
       generate: (_config, _content, { onEvent }) => {
         call += 1;
         if (call === 1) {
-          onEvent?.({ type: 'llm.failed.remote', error: { kind: 'unknown', message: 'llm down' } });
+          onEvent?.({
+            type: 'llm.failed.remote',
+            error: { kind: 'unknown', message: 'llm down', retryable: false },
+          });
           return Promise.resolve();
         }
         streamMessage(createAssistantMessage([{ type: 'text', text: 'recovered' }]), onEvent);
@@ -886,7 +888,7 @@ describe('agent machine lifecycle', () => {
     await vi.waitFor(() => {
       expect(rolesAndTexts(store.getState().history)).toEqual(['user:hi']);
     });
-    expect(failures[0]).toMatchObject({ kind: 'unknown', message: 'llm down' });
+    expect(failures[0]).toMatchObject({ kind: 'unknown', message: 'llm down', retryable: false });
     expect(actor.getSnapshot().status).toBe('active');
 
     actor.send({ type: 'input.submit', entry: { message: createUserMessage('retry') } });
@@ -1182,6 +1184,7 @@ describe('agent machine llm retry', () => {
               requestId: null,
               retryAfterMs: null,
               headers: null,
+              retryable: true,
             },
           });
           return Promise.resolve();
@@ -1190,12 +1193,9 @@ describe('agent machine llm retry', () => {
         return Promise.resolve();
       },
     };
-    const ticks = [1000, 1100, 1200, 100000, 100100, 100140, 100200];
-    const timingPlugin = createTimingPlugin({ now: () => ticks.shift() ?? Number.NaN });
     const tools: ToolDefinition[] = [];
     const store = await testStore();
     const actor = createTestAgent(store, requester, tools, { retry: { maxAttemptsPerStep: 3 } });
-    connectPlugins(actor, [timingPlugin]);
     const retrying: Extract<LlmEvent, { type: 'llm.retrying' }>[] = [];
     const failures: unknown[] = [];
     actor.on('llm.retrying', (event) => retrying.push(event));
@@ -1219,17 +1219,6 @@ describe('agent machine llm retry', () => {
     });
     expect(failures).toHaveLength(0);
     expect(rolesAndTexts(store.getState().history)).toEqual(['user:hi', 'assistant:recovered']);
-
-    const delayMs = retrying[0]?.delayMs ?? 0;
-    expect(timingPlugin.timing()).toEqual({
-      requestBuildMs: 100000 - (1200 + delayMs),
-      ttftMs: 100100 - (1200 + delayMs),
-      serverFirstTokenMs: 100,
-      streamDurationMs: 100,
-      serverDecodeMs: 60,
-      clientConsumeMs: 40,
-    });
-    expect(ticks).toHaveLength(0);
   });
 });
 
@@ -1415,7 +1404,7 @@ describe('agent machine input.abort', () => {
             onEvent?.({ type: 'llm.streaming.part', part });
           }
           signal.addEventListener('abort', () => {
-            onEvent?.({ type: 'llm.failed.remote', error: { kind: 'abort', message: 'aborted' } });
+            onEvent?.({ type: 'llm.failed.remote', error: { kind: 'abort', message: 'aborted', retryable: false } });
             resolve();
           });
         });
@@ -1459,7 +1448,7 @@ describe('agent machine input.abort', () => {
         signals.push(signal);
         return new Promise((resolve) => {
           signal.addEventListener('abort', () => {
-            onEvent?.({ type: 'llm.failed.remote', error: { kind: 'abort', message: 'aborted' } });
+            onEvent?.({ type: 'llm.failed.remote', error: { kind: 'abort', message: 'aborted', retryable: false } });
             resolve();
           });
         });
@@ -1669,7 +1658,7 @@ describe('agent machine input.abort', () => {
             signal.addEventListener('abort', () => {
               onEvent?.({
                 type: 'llm.failed.remote',
-                error: { kind: 'abort', message: 'aborted' },
+                error: { kind: 'abort', message: 'aborted', retryable: false },
               });
               resolve();
             });
@@ -1721,7 +1710,7 @@ describe('agent machine input.abort', () => {
             signal.addEventListener('abort', () => {
               onEvent?.({
                 type: 'llm.failed.remote',
-                error: { kind: 'abort', message: 'aborted' },
+                error: { kind: 'abort', message: 'aborted', retryable: false },
               });
               resolve();
             });

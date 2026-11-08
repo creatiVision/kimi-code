@@ -66,7 +66,6 @@
         ./packages/agent-core-v2
         ./packages/kap-server
         ./packages/klient
-        ./packages/kosong
         ./packages/migration-legacy
         ./packages/minidb
         ./packages/node-sdk
@@ -76,7 +75,6 @@
         ./packages/remote-control
         ./packages/session-import
         ./packages/telemetry
-        ./packages/transcript
         ./packages/tree-sitter-bash
         ./apps/kimi-code
         ./apps/vscode
@@ -90,7 +88,6 @@
         "@moonshot-ai/acp-server"
         "@moonshot-ai/agent-core-v2"
         "@moonshot-ai/kap-server"
-        "@moonshot-ai/kosong"
         "@moonshot-ai/migration-legacy"
         "@moonshot-ai/minidb"
         "@moonshot-ai/kimi-code-sdk"
@@ -101,7 +98,6 @@
         "@moonshot-ai/remote-control"
         "@moonshot-ai/session-import"
         "@moonshot-ai/kimi-telemetry"
-        "@moonshot-ai/transcript"
         "@moonshot-ai/tree-sitter-bash"
         "@moonshot-ai/kimi-code"
         "kimi-code"

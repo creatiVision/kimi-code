@@ -137,11 +137,76 @@ describe('facade routing', () => {
     channel.result = status;
     await expect(klient.global.capabilities.get('kimi-cu')).resolves.toEqual(status);
     await expect(klient.global.capabilities.install('kimi-cu')).resolves.toEqual(status);
+    const confirmation = {
+      ...status,
+      install: { running: false, confirmationRequired: 'stop-processes' },
+    };
+    channel.result = confirmation;
+    await expect(klient.global.capabilities.install('kimi-cu', { stopRunningProcesses: true }))
+      .resolves.toEqual(confirmation);
 
     expect(channel.calls).toEqual([
       { scope: {}, service: 'capabilityService', method: 'listCapabilities', args: [] },
       { scope: {}, service: 'capabilityService', method: 'getCapability', args: ['kimi-cu'] },
-      { scope: {}, service: 'capabilityService', method: 'installCapability', args: ['kimi-cu'] },
+      { scope: {}, service: 'capabilityService', method: 'installCapability', args: ['kimi-cu', undefined] },
+      {
+        scope: {},
+        service: 'capabilityService',
+        method: 'installCapability',
+        args: ['kimi-cu', { stopRunningProcesses: true }],
+      },
+    ]);
+  });
+
+  it('routes custom and marketplace plugin installs through the same contract', async () => {
+    const channel = new FakeChannel();
+    const klient = createKlientFromChannel(channel);
+    channel.result = {
+      id: 'demo',
+      displayName: 'Demo',
+      description: 'Plugin description',
+      shortDescription: 'Short description',
+      longDescription: 'Long description',
+      enabled: true,
+      state: 'ok',
+      skillCount: 0,
+      mcpServerCount: 0,
+      enabledMcpServerCount: 0,
+      hookCount: 0,
+      commandCount: 0,
+      hasErrors: false,
+      source: 'zip-url',
+      origin: 'marketplace',
+      catalogId: 'demo',
+      installedAt: '2026-01-01T00:00:00.000Z',
+    };
+
+    await expect(klient.global.plugins.install('/tmp/demo')).resolves.toMatchObject({
+      description: 'Plugin description',
+      shortDescription: 'Short description',
+      longDescription: 'Long description',
+    });
+    await expect(
+      klient.global.plugins.install({ marketplaceId: 'demo', expectedVersion: '1.0.0' }),
+    ).resolves.toMatchObject({
+      description: 'Plugin description',
+      shortDescription: 'Short description',
+      longDescription: 'Long description',
+    });
+
+    expect(channel.calls).toEqual([
+      {
+        scope: {},
+        service: 'pluginService',
+        method: 'installPlugin',
+        args: [{ source: '/tmp/demo' }],
+      },
+      {
+        scope: {},
+        service: 'pluginService',
+        method: 'installPlugin',
+        args: [{ marketplaceId: 'demo', expectedVersion: '1.0.0' }],
+      },
     ]);
   });
 
@@ -345,7 +410,13 @@ describe('session skills routing', () => {
     const scope = { sessionId: 's1', agentId: 'main' };
 
     channel.results.set('agentPromptService.submit', { turn_id: 1 });
-    channel.results.set('agentPromptService.submitSteer', { turn_id: 1 });
+    channel.results.set('agentPromptService.submitSteer', {
+      turn_id: 1,
+      prompt_id: 'prompt-steer-1',
+      created_at: '2026-01-01T00:00:00.000Z',
+      state: 'running',
+      steered: true,
+    });
     channel.results.set('agentCommandService.list', []);
     await agent.prompt({ input: [{ type: 'text', text: 'hi' }] });
     await agent.steer({ input: [{ type: 'text', text: 'steer' }] });
