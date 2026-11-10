@@ -770,6 +770,28 @@ describe('SessionEventBroadcaster', () => {
     expect(globalView.deliveries).toEqual(['immediate']);
   });
 
+  it('fans out event.session.restored to every connection, including for cold sessions', async () => {
+    const globalView = collectingTarget();
+    bc.addGlobalTarget(globalView.target);
+
+    eventBus.emit({
+      type: 'event.session.restored',
+      payload: { sessionId: 'cold-1', workspaceId: 'wd_cold' },
+    });
+
+    await vi.waitFor(() => expect(globalView.envelopes).toHaveLength(1));
+    expect(globalView.envelopes[0]).toMatchObject({
+      type: 'event.session.restored',
+      session_id: '__global__',
+      payload: {
+        type: 'event.session.restored',
+        agentId: 'main',
+        sessionId: 'cold-1',
+        workspace_id: 'wd_cold',
+      },
+    });
+  });
+
   it('fans out event.session.deleted to every connection, including for cold sessions', async () => {
     const globalView = collectingTarget();
     bc.addGlobalTarget(globalView.target);
@@ -861,51 +883,6 @@ describe('SessionEventBroadcaster', () => {
         root: '/repo/a',
       },
     });
-  });
-
-  it('gates event.di.unit_changed to connections opted into the DI debug feed', async () => {
-    const plainView = collectingTarget();
-    bc.addGlobalTarget(plainView.target);
-    const diView = collectingTarget();
-    bc.addGlobalTarget(diView.target);
-    bc.addDiEventTarget(diView.target);
-
-    eventBus.emit({
-      type: 'event.di.unit_changed',
-      payload: { scope: 'app', token: 'debugCascadeService', state: 'Active' },
-    });
-
-    await vi.waitFor(() => expect(diView.envelopes).toHaveLength(1));
-    expect(diView.envelopes[0]).toMatchObject({
-      type: 'event.di.unit_changed',
-      session_id: '__global__',
-      payload: {
-        type: 'event.di.unit_changed',
-        scope: 'app',
-        token: 'debugCascadeService',
-        state: 'Active',
-        agentId: 'main',
-        sessionId: '__global__',
-      },
-    });
-    expect(diView.deliveries).toEqual(['immediate']);
-    expect(plainView.envelopes).toHaveLength(0);
-
-    eventBus.emit({
-      type: 'event.di.unit_changed',
-      payload: { scope: 'app', token: 'x', state: 'Exploded' },
-    });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(diView.envelopes).toHaveLength(1);
-
-    bc.removeGlobalTarget(diView.target);
-    eventBus.emit({
-      type: 'event.di.unit_changed',
-      payload: { scope: 'app', token: 'debugCascadeService', state: 'Unloading' },
-    });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(diView.envelopes).toHaveLength(1);
-    expect(plainView.envelopes).toHaveLength(0);
   });
 
   describe('global fan-out to unsubscribed connections', () => {

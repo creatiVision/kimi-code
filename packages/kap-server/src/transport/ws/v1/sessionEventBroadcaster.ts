@@ -28,7 +28,6 @@ import {
 } from '@moonshot-ai/agent-core-v2';
 import type {
   ConfigWarningItem,
-  DiUnitChangedEvent,
   ModelCatalogRefreshChange,
   ModelCatalogRefreshFailure,
   ModelCatalogRetiredDefault,
@@ -135,7 +134,6 @@ export class SessionEventBroadcaster {
   private readonly sessions = new Map<string, SessionState>();
   private readonly workTrackers = new Map<string, WorkTracker>();
   private readonly globalTargets = new Set<BroadcastTarget>();
-  private readonly diEventTargets = new Set<BroadcastTarget>();
   private globalQueue: Promise<void> = Promise.resolve();
   private readonly coreEventSubscription: IDisposable;
   private readonly deletionSubscription: IDisposable | undefined;
@@ -194,11 +192,6 @@ export class SessionEventBroadcaster {
 
   removeGlobalTarget(target: BroadcastTarget): void {
     this.globalTargets.delete(target);
-    this.diEventTargets.delete(target);
-  }
-
-  addDiEventTarget(target: BroadcastTarget): void {
-    this.diEventTargets.add(target);
   }
 
   async subscribe(
@@ -563,13 +556,14 @@ export class SessionEventBroadcaster {
       }));
       return;
     }
-    if (event.type === 'event.session.archived') {
-      const payload = sessionArchivedPayload(corePayload);
+    if (event.type === 'event.session.archived' || event.type === 'event.session.restored') {
+      const payload = sessionLifecyclePayload(corePayload);
       if (payload === undefined) return;
+      const type = event.type;
       this.enqueueGlobal(
-        event.type,
+        type,
         () => ({
-          type: 'event.session.archived',
+          type,
           workspace_id: payload.workspaceId,
           agentId: 'main',
           sessionId: payload.sessionId,
@@ -579,7 +573,7 @@ export class SessionEventBroadcaster {
       return;
     }
     if (event.type === 'event.session.deleted') {
-      const payload = sessionDeletedPayload(corePayload);
+      const payload = sessionLifecyclePayload(corePayload);
       if (payload === undefined) return;
       this.enqueueGlobal(
         event.type,
@@ -686,16 +680,6 @@ export class SessionEventBroadcaster {
       }));
       return;
     }
-    if (event.type === 'event.di.unit_changed') {
-      const payload = diUnitChangedPayload(corePayload);
-      if (payload === undefined) return;
-      this.enqueueGlobal(event.type, () => ({
-        type: 'event.di.unit_changed',
-        ...payload,
-        agentId: 'main',
-        sessionId: GLOBAL_SESSION_ID,
-      }));
-    }
   }
 
   private enqueueGlobal(
@@ -720,9 +704,7 @@ export class SessionEventBroadcaster {
         event.time !== undefined ? new Date(event.time).toISOString() : new Date().toISOString(),
       payload: event,
     };
-    const diGated = event.type.startsWith('event.di.');
     for (const target of this.globalTargets) {
-      if (diGated && !this.diEventTargets.has(target)) continue;
       try {
         target.send(envelope, 'immediate');
       } catch {
@@ -891,32 +873,6 @@ function sessionMetaUpdatedSessionId(payload: unknown): string | undefined {
   return typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : undefined;
 }
 
-const DI_UNIT_STATES: ReadonlySet<string> = new Set([
-  'Pending',
-  'Activating',
-  'Active',
-  'Unloading',
-  'Failed',
-]);
-
-function diUnitChangedPayload(
-  payload: unknown,
-): Pick<DiUnitChangedEvent, 'scope' | 'token' | 'state' | 'error'> | undefined {
-  if (typeof payload !== 'object' || payload === null) return undefined;
-  const candidate = payload as Partial<DiUnitChangedEvent>;
-  if (typeof candidate.scope !== 'string' || candidate.scope.length === 0) return undefined;
-  if (typeof candidate.token !== 'string' || candidate.token.length === 0) return undefined;
-  if (typeof candidate.state !== 'string' || !DI_UNIT_STATES.has(candidate.state)) {
-    return undefined;
-  }
-  return {
-    scope: candidate.scope,
-    token: candidate.token,
-    state: candidate.state as DiUnitChangedEvent['state'],
-    error: typeof candidate.error === 'string' ? candidate.error : undefined,
-  };
-}
-
 function sessionCreatedPayload(
   payload: unknown,
 ): { sessionId: string; session: SessionCreatedEvent['session'] } | undefined {
@@ -936,21 +892,7 @@ function sessionCreatedPayload(
   return { sessionId, session };
 }
 
-function sessionArchivedPayload(
-  payload: unknown,
-): { sessionId: string; workspaceId: string } | undefined {
-  if (typeof payload !== 'object' || payload === null) return undefined;
-  const candidate = payload as { sessionId?: unknown; workspaceId?: unknown };
-  if (typeof candidate.sessionId !== 'string' || candidate.sessionId.length === 0) {
-    return undefined;
-  }
-  if (typeof candidate.workspaceId !== 'string' || candidate.workspaceId.length === 0) {
-    return undefined;
-  }
-  return { sessionId: candidate.sessionId, workspaceId: candidate.workspaceId };
-}
-
-function sessionDeletedPayload(
+function sessionLifecyclePayload(
   payload: unknown,
 ): { sessionId: string; workspaceId: string } | undefined {
   if (typeof payload !== 'object' || payload === null) return undefined;

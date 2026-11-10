@@ -14,6 +14,8 @@ import { ContextAppendLoopEvent, ContextAppendMessage, ContextClear } from '@moo
 import type { LoopRecordedEvent } from '@moonshot-ai/agent-core-v2/agent/contextMemory/loopEventFold';
 import { AssistantDelta, ThinkingDelta, ToolCallDelta } from '@moonshot-ai/agent-core-v2/agent/loop/turnEvents';
 import { TurnEnded, TurnPrompt } from '@moonshot-ai/agent-core-v2/agent/loop/turnOps';
+import { TaskStarted } from '@moonshot-ai/agent-core-v2/agent/task/taskOps';
+import type { AgentTaskInfo } from '@moonshot-ai/agent-core-v2/agent/task/types';
 import { AgentStateService } from '@moonshot-ai/agent-core-v2/agent/state/agentStateService';
 import { ToolProgress } from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
 import { EventBusService } from '@moonshot-ai/agent-core-v2/app/event/eventBusService';
@@ -201,7 +203,7 @@ describe('conversation fold', () => {
     ]);
   });
 
-  it('keeps the visible text, attachments, skills and client metadata of a user message and no server paths', () => {
+  it('keeps visible user content and skill paths while hiding attachment server paths', () => {
     const fileId = 'f_0a1b2c3d-0000-4000-8000-000000000001';
     const state = fold([
       turnPrompt(0, 'p1'),
@@ -240,10 +242,11 @@ describe('conversation fold', () => {
         { kind: 'file', name: 'local.txt', media_type: 'text/plain', size: 9, ordinal: 2 },
         { kind: 'video', file_id: fileId, ordinal: 3 },
       ],
-      skills: [{ name: 'review', args: '--deep' }],
+      skills: [{ name: 'review', path: '/home/example/skills/review', args: '--deep' }],
       metadata: { display_text: 'check this diff' },
     });
-    expect(JSON.stringify(opener)).not.toContain('/home/example');
+    expect(JSON.stringify(opener)).not.toContain('/home/example/notes.md');
+    expect(JSON.stringify(opener)).not.toContain('/home/example/local.txt');
   });
 
   it('maps engine origins to protocol origins and gives system-triggered inputs no prompt ids', () => {
@@ -269,13 +272,20 @@ describe('conversation fold', () => {
       userMessage('g1', 'Continue working toward the active goal', { kind: 'system_trigger', name: 'goal_continuation' }),
       userMessage(undefined, 'Report back to the parent agent', { kind: 'system_trigger', name: 'subagent' }),
       turnPrompt(2, 'cron-1', { kind: 'cron_job' }),
-      userMessage('cron-1', 'nightly report', {
+      userMessage('cron-1', '<cron-fire jobId="job-1" cron="0 3 * * *" recurring="true" coalescedCount="2" stale="false">\n<prompt>\nnightly report\n</prompt>\n</cron-fire>', {
         kind: 'cron_job',
         jobId: 'job-1',
         cron: '0 3 * * *',
         recurring: true,
         coalescedCount: 2,
         stale: false,
+      }),
+      turnPrompt(6, 'cron-nested', { kind: 'cron_job' }),
+      userMessage('cron-nested', '<cron-fire jobId="job-3" cron="0 * * * *" recurring="true" coalescedCount="1" stale="false">\n<prompt>\nSummarize:\n<prompt>\ninner\n</prompt>\n</prompt>\n</cron-fire>', {
+        kind: 'cron_job',
+        jobId: 'job-3',
+        cron: '0 * * * *',
+        recurring: true,
       }),
       turnPrompt(3, 'cron-legacy', { kind: 'cron_job' }),
       userMessage('cron-legacy', 'weekly digest', { kind: 'cron_job', jobId: 'job-2', cron: '0 9 * * 1', recurring: true }),
@@ -287,12 +297,13 @@ describe('conversation fold', () => {
 
     const openers = state.turns.map((turn) => turn.items[0]);
     expect(openers.map((item) => (item?.type === 'user_message' ? [item.origin, item.prompt_ids, item.text] : []))).toEqual([
-      [{ kind: 'skill', name: 'commit', args: '-m wip' }, ['k1'], 'User activated the skill'],
+      [{ kind: 'skill', name: 'commit', path: '/home/example/skills/commit', args: '-m wip' }, ['k1'], 'User activated the skill'],
       [{ kind: 'plugin_command', plugin_id: 'example-plugin', command: 'deploy', args: 'staging' }, ['c1'], 'Plugin command'],
       [{ kind: 'retry' }, [], ''],
       [{ kind: 'goal' }, [], ''],
       [{ kind: 'system' }, [], 'Report back to the parent agent'],
       [{ kind: 'cron', job_id: 'job-1', schedule: '0 3 * * *', recurring: true, coalesced_count: 2, stale: false }, [], 'nightly report'],
+      [{ kind: 'cron', job_id: 'job-3', schedule: '0 * * * *', recurring: true, coalesced_count: 1, stale: false }, [], 'Summarize:\n<prompt>\ninner\n</prompt>'],
       [{ kind: 'cron', job_id: 'job-2', schedule: '0 9 * * 1', recurring: true, coalesced_count: 1, stale: false }, [], 'weekly digest'],
       [{ kind: 'system' }, [], 'missed runs'],
       [{ kind: 'hook', hook_event: 'SessionStart' }, [], 'hook output'],
@@ -642,6 +653,96 @@ describe('conversation fold', () => {
 
     expect(state.turns).toHaveLength(2);
     expect(shape(state.turns[1])).toEqual(['opener:second', 'steer:more']);
+  });
+
+  it('ends the tool calls a stop cuts short as interrupted and keeps earlier results as they were', () => {
+    const state = fold([
+      turnPrompt(0, 'p1'),
+      userMessage('p1', 'run them'),
+      stepBegin(0, 1, 's1'),
+      toolCall(0, 1, 's1', 'Read_0', 'Read', { path: 'a.ts' }),
+      toolCall(0, 1, 's1', 'Read_1', 'Read', { path: 'missing.ts' }),
+      toolCall(0, 1, 's1', 'Bash_2', 'Bash', { command: 'sleep 60' }),
+      toolCall(0, 1, 's1', 'Bash_3', 'Bash', { command: 'make' }),
+      toolResult('Read_0', 'file body'),
+      toolResult('Read_1', 'file not found', true),
+      record('turn.cancel', { turnId: 0, target: 'active', reason: 'user' }),
+      toolResult('Bash_2', 'Interrupted by user', true),
+      toolResult('Bash_3', 'The user manually interrupted "Bash".', true),
+      turnEnded(0, 'cancelled'),
+    ]);
+
+    const items = state.turns[0]?.items ?? [];
+    expect(state.turns[0]).toMatchObject({ outcome: 'interrupted' });
+    expect(items[1]).toMatchObject({ item_id: 'Read_0', outcome: 'completed', output: 'file body' });
+    expect(items[2]).toMatchObject({ item_id: 'Read_1', outcome: 'failed', error: 'file not found' });
+    expect(items[3]).toMatchObject({ item_id: 'Bash_2', outcome: 'interrupted', error: 'Interrupted by user' });
+    expect(items[4]).toMatchObject({ item_id: 'Bash_3', outcome: 'interrupted' });
+    expect(items[3]).not.toHaveProperty('output', expect.anything());
+  });
+
+  it('keeps tool errors failed when the step failed instead of being stopped', () => {
+    const state = fold([
+      turnPrompt(0, 'p1'),
+      userMessage('p1', 'run it'),
+      stepBegin(0, 1, 's1'),
+      toolCall(0, 1, 's1', 'Bash_0', 'Bash', { command: 'make' }),
+      record('turn.step.interrupted', { turnId: 0, step: 1, stepId: 's1', reason: 'error' }),
+      toolResult('Bash_0', 'Tool "Bash" was aborted', true),
+      turnEnded(0, 'failed', { error: { name: 'ProviderError', message: 'boom' } }),
+    ]);
+
+    expect(state.turns[0]?.items[1]).toMatchObject({ item_id: 'Bash_0', outcome: 'failed' });
+  });
+
+  it('keeps the note of a tool result beside its output', () => {
+    const note = 'Read image file. Mime type: image/png. Size: 1234 bytes. Original dimensions: 640x480 pixels.';
+    const state = fold([
+      turnPrompt(0, 'p1'),
+      userMessage('p1', 'look'),
+      stepBegin(0, 1, 's1'),
+      toolCall(0, 1, 's1', 'ReadMediaFile_0', 'ReadMediaFile', { path: '/tmp/a.png' }),
+      toolCall(0, 1, 's1', 'Read_1', 'Read', { path: 'a.ts' }),
+      loop({
+        type: 'tool.result',
+        toolCallId: 'ReadMediaFile_0',
+        result: {
+          output: [
+            { type: 'text', text: '<image path="/tmp/a.png">' },
+            { type: 'text', text: '</image>' },
+          ],
+          note,
+        },
+      }),
+      toolResult('Read_1', 'file body'),
+    ]);
+
+    const items = state.turns[0]?.items ?? [];
+    expect(items[1]).toMatchObject({ item_id: 'ReadMediaFile_0', outcome: 'completed', output: '<image path="/tmp/a.png"></image>', note });
+    expect(items[2]).toMatchObject({ item_id: 'Read_1', output: 'file body' });
+    expect(items[2]).not.toHaveProperty('note', expect.anything());
+  });
+
+  it('links each tool call to the task it runs as', () => {
+    const state = fold([
+      turnPrompt(0, 'p1'),
+      userMessage('p1', 'start the server, audit, and ask'),
+      stepBegin(0, 1, 's1'),
+      toolCall(0, 1, 's1', 'Bash_0', 'Bash', { command: 'npm run dev', run_in_background: true }),
+      record('task.started', { info: { kind: 'process', taskId: 'bash-k3f9', parentToolCallId: 'Bash_0' } }),
+      toolCall(0, 1, 's1', 'Agent_1', 'Agent', { prompt: 'audit the docs' }),
+      record('task.started', { info: { kind: 'agent', taskId: 'agent-1', parentToolCallId: 'Agent_1' } }),
+      toolCall(0, 1, 's1', 'Ask_2', 'AskUserQuestion', { questions: [] }),
+      record('task.started', { info: { kind: 'question', taskId: 'question-1', toolCallId: 'Ask_2' } }),
+      record('task.started', { info: { kind: 'process', taskId: 'bash-other', parentToolCallId: 'Bash_9' } }),
+      toolResult('Bash_0', 'task_id: bash-k3f9\nstatus: running'),
+    ]);
+
+    const byId = new Map((state.turns[0]?.items ?? []).map((item) => [item.item_id, item]));
+    expect(byId.get('Bash_0')).toMatchObject({ task_id: 'bash-k3f9', outcome: 'completed' });
+    expect(byId.get('Agent_1')).toMatchObject({ task_id: 'agent-1' });
+    expect(byId.get('Ask_2')).toMatchObject({ task_id: 'question-1' });
+    expect([...byId.keys()]).not.toContain('Bash_9');
   });
 
   it('keeps a running turn open while ownerless messages land beside it', () => {
@@ -999,6 +1100,18 @@ describe('conversation feed', () => {
     expect(ended.map((item) => item.item_id)).toEqual(['s1:0', 's1:1']);
     expect(ended[0]).toMatchObject({ type: 'reasoning', duration_ms: 1_500 });
     h.dispatcher.dispose();
+  });
+
+  it('announces the task a running tool call starts', async () => {
+    const h = feedHarness([]);
+    await runningTurn(h);
+    await h.dispatcher.dispatch(loopEvent({ type: 'tool.call', stepUuid: 's1', toolCallId: 'call-1', name: 'Bash', args: { command: 'npm test' }, turnId: '0', step: 1 }));
+    await flushed();
+    const info = { kind: 'process', taskId: 'bash-p81', parentToolCallId: 'call-1' } as unknown as AgentTaskInfo;
+    await h.dispatcher.dispatch(new TaskStarted({ agentId: 'main', info }));
+    await flushed();
+
+    expect(h.events.at(-1)).toMatchObject({ type: 'item.updated', item_id: 'call-1', set: { task_id: 'bash-p81' } });
   });
 
   it('streams a tool call through its stages, input, output and progress', async () => {

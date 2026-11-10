@@ -88,7 +88,7 @@ const itemFields = {
 
 export const userMessageOriginSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('user') }),
-  z.object({ kind: z.literal('skill'), name: z.string(), args: z.string().optional() }),
+  z.object({ kind: z.literal('skill'), name: z.string(), path: z.string().optional(), args: z.string().optional() }),
   z.object({
     kind: z.literal('plugin_command'),
     plugin_id: z.string(),
@@ -137,7 +137,7 @@ export const userMessageItemSchema = z.object({
   origin: userMessageOriginSchema,
   text: z.string(),
   attachments: z.array(attachmentSchema),
-  skills: z.array(z.object({ name: z.string(), args: z.string().optional() })),
+  skills: z.array(z.object({ name: z.string(), path: z.string().optional(), args: z.string().optional() })),
   metadata: z.record(z.string(), z.unknown()).optional(),
 });
 export type UserMessageItem = z.infer<typeof userMessageItemSchema>;
@@ -201,7 +201,9 @@ export const toolCallItemSchema = z.object({
   output: z.string().optional(),
   media: z.array(mediaSchema).optional(),
   error: z.string().optional(),
+  note: z.string().optional(),
   progress: toolProgressSchema.optional(),
+  task_id: z.string().optional(),
   interaction_id: z.string().optional(),
   agent_refs: z.array(agentRefSchema).optional(),
   started_at: isoDateTimeSchema,

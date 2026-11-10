@@ -113,7 +113,7 @@ export interface McpDefaults {
 
 export interface McpConnectionManagerOptions {
   readonly envLookup?: (name: string) => string | undefined;
-  readonly stdioCwd?: string;
+  readonly stdioCwd?: string | (() => string);
   readonly environmentResolver?: import('#/app/environment/environment').EnvironmentResolver;
   readonly environmentId?: string;
   readonly requireStdioEnvironmentId?: boolean;
@@ -806,7 +806,7 @@ export class McpConnectionManager implements McpConnectionView {
       return new StdioMcpClient(config, {
         startupTimeoutMs,
         toolCallTimeoutMs,
-        defaultCwd: this.options.stdioCwd,
+        defaultCwd: typeof this.options.stdioCwd === 'function' ? this.options.stdioCwd() : this.options.stdioCwd,
         clientName,
         environmentResolver,
         environmentId,

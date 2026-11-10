@@ -125,11 +125,11 @@ function sendMappedError(
 ): void {
   const requestId = req.id;
   if (err instanceof SessionNotFoundError) {
-    reply.send(errEnvelope(ErrorCode.SESSION_NOT_FOUND, err.message, requestId, err.stack));
+    reply.send(errEnvelope(ErrorCode.SESSION_NOT_FOUND, err.message, requestId));
     return;
   }
   if (err instanceof MessageNotFoundError) {
-    reply.send(errEnvelope(ErrorCode.MESSAGE_NOT_FOUND, err.message, requestId, err.stack));
+    reply.send(errEnvelope(ErrorCode.MESSAGE_NOT_FOUND, err.message, requestId));
     return;
   }
   sendSessionMappedError(reply, req, err);

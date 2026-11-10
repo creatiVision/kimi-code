@@ -20,6 +20,11 @@ export const sessionArchivedEventSchema = z.object({
   workspace_id: z.string().min(1),
 });
 
+export const sessionRestoredEventSchema = z.object({
+  type: z.literal('event.session.restored'),
+  workspace_id: z.string().min(1),
+});
+
 export const sessionDeletedEventSchema = z.object({
   type: z.literal('event.session.deleted'),
   workspace_id: z.string().min(1),
@@ -116,18 +121,11 @@ export const capabilityChangedEventSchema = z.object({
   }),
 });
 
-export const diUnitChangedEventSchema = z.object({
-  type: z.literal('event.di.unit_changed'),
-  scope: z.string().min(1),
-  token: z.string().min(1),
-  state: z.enum(['Pending', 'Activating', 'Active', 'Unloading', 'Failed']),
-  error: z.string().optional(),
-});
-
 export const pushEventSchema = z.discriminatedUnion('type', [
   sessionMetaUpdatedEventSchema,
   sessionCreatedEventSchema,
   sessionArchivedEventSchema,
+  sessionRestoredEventSchema,
   sessionDeletedEventSchema,
   workspaceCreatedEventSchema,
   workspaceUpdatedEventSchema,
@@ -136,7 +134,6 @@ export const pushEventSchema = z.discriminatedUnion('type', [
   configChangedEventSchema,
   configWarningEventSchema,
   modelCatalogChangedEventSchema,
-  diUnitChangedEventSchema,
   pluginChangedEventSchema,
   capabilityChangedEventSchema,
 ]).and(
